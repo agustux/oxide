@@ -177,6 +177,8 @@ const DEFAULT_CONFIG_FILE: &str = r##"# Oxide configuration.
 # Font and color changes apply live; [shell] and [prompt] changes apply to
 # newly started sessions.
 
+bell = "sound"                # none | sound | visual
+
 [font]
 family      = "JetBrainsMono Nerd Font Mono"
                               # or a list: the rest are fallbacks for CJK/emoji,
@@ -225,7 +227,6 @@ open_on_startup   = true      # false starts with the drawer hidden (cmd-b shows
 # [editor]
 # open_at_line = "myeditor --line {line} {path}"   # for editors Oxide doesn't know
 
-# bell = "none"               # none | sound | visual
 # copy_on_select = false      # mouse selection copies to clipboard on release
 
 [status_bar]
