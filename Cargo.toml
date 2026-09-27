@@ -18,6 +18,9 @@ serde_json = "1"
 directories = "5"
 # Already pulled in by alacritty_terminal; column math for the markdown preview.
 unicode-width = "0.2"
+# The markdown preview's parser: CommonMark plus the GitHub extensions.
+# Without the default features, which are its HTML writer and a CLI.
+pulldown-cmark = { version = "0.13", default-features = false }
 # Code-block highlighting in the markdown preview. two-face adds the grammars
 # syntect's own set lacks — TOML above all. onig is syntect's default regex
 # backend and the faster one; regex-fancy would also switch on bit-set/std,
@@ -35,6 +38,8 @@ trash = "5.2.9"
 # GNU libobjc lacks, and block wants BlocksRuntime — both fail at link time.
 objc = "0.2"
 block = "0.1"
+# Also gpui's: the way from its window to the NSWindow, for background blur.
+raw-window-handle = "0.6"
 
 [profile.release]
 lto = "fat"

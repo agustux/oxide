@@ -30,31 +30,56 @@ impl LineEdit {
             .map_or(self.text.len(), |(b, _)| b)
     }
 
+    /// The far edge of the word before or after the cursor: across any
+    /// separators first, then across the word. Punctuation separates, so a
+    /// path moves a component at a time.
+    fn word_edge(&self, forward: bool) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut at = self.cursor;
+        for in_word in [false, true] {
+            loop {
+                let next = if forward { Some(at) } else { at.checked_sub(1) };
+                match next.and_then(|i| chars.get(i)) {
+                    Some(c) if c.is_alphanumeric() == in_word => {
+                        at = if forward { at + 1 } else { at - 1 }
+                    }
+                    _ => break,
+                }
+            }
+        }
+        at
+    }
+
+    /// Remove the chars in `from..to` and leave the cursor where they were.
+    fn delete(&mut self, from: usize, to: usize) {
+        let (b, e) = (self.byte(from), self.byte(to));
+        self.text.replace_range(b..e, "");
+        self.cursor = from;
+    }
+
     /// Apply an editing key. Returns whether it was one; anything else
     /// (enter, escape) is the caller's.
     pub fn handle(&mut self, ks: &Keystroke) -> bool {
         let m = ks.modifiers;
         let len = self.text.chars().count();
+        // Word-wise: option on macOS, control everywhere else.
+        let word = m.alt || (m.control && !cfg!(target_os = "macos"));
         match ks.key.as_str() {
             "left" if m.platform => self.cursor = 0,
             "right" if m.platform => self.cursor = len,
+            "left" if word => self.cursor = self.word_edge(false),
+            "right" if word => self.cursor = self.word_edge(true),
             "left" => self.cursor = self.cursor.saturating_sub(1),
             "right" => self.cursor = (self.cursor + 1).min(len),
             "home" => self.cursor = 0,
             "end" => self.cursor = len,
             "a" if m.control => self.cursor = 0,
             "e" if m.control => self.cursor = len,
-            "backspace" if self.cursor > 0 => {
-                let (b, e) = (self.byte(self.cursor - 1), self.byte(self.cursor));
-                self.text.replace_range(b..e, "");
-                self.cursor -= 1;
-            }
-            "backspace" => {}
-            "delete" if self.cursor < len => {
-                let (b, e) = (self.byte(self.cursor), self.byte(self.cursor + 1));
-                self.text.replace_range(b..e, "");
-            }
-            "delete" => {}
+            "backspace" if m.platform => self.delete(0, self.cursor),
+            "backspace" if word => self.delete(self.word_edge(false), self.cursor),
+            "backspace" => self.delete(self.cursor.saturating_sub(1), self.cursor),
+            "delete" if word => self.delete(self.cursor, self.word_edge(true)),
+            "delete" => self.delete(self.cursor, (self.cursor + 1).min(len)),
             _ => {
                 let plain = !m.platform && !m.control && !m.function;
                 let Some(c) = ks.key_char.as_deref().filter(|_| plain) else {
@@ -102,5 +127,27 @@ mod tests {
         e.handle(&key("delete"));
         assert_eq!(e.text, "tés");
         assert!(!e.handle(&key("enter")));
+    }
+
+    #[test]
+    fn option_moves_and_deletes_by_word() {
+        let mut e = LineEdit::new("src/té st.rs".into());
+        e.handle(&key("alt-left"));
+        assert_eq!(e.split(), ("src/té st.", "rs"));
+        e.handle(&key("alt-backspace"));
+        assert_eq!(e.split(), ("src/té ", "rs"), "separators go with the word");
+        e.handle(&key("alt-left"));
+        e.handle(&key("alt-left"));
+        assert_eq!(e.split(), ("", "src/té rs"));
+        e.handle(&key("alt-right"));
+        e.handle(&key("alt-delete"));
+        assert_eq!(e.split(), ("src", " rs"));
+        e.handle(&key("cmd-backspace"));
+        assert_eq!(e.text, " rs");
+        // Nothing to cross at either end.
+        e.handle(&key("alt-backspace"));
+        e.handle(&key("cmd-right"));
+        e.handle(&key("alt-delete"));
+        assert_eq!(e.text, " rs");
     }
 }

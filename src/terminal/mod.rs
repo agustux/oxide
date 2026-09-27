@@ -990,6 +990,18 @@ impl TerminalPane {
         self.foreground.as_ref().and_then(|f| f.ssh_host.as_deref())
     }
 
+    /// Something other than the shell has the terminal (an editor, a build),
+    /// so a command sent here wouldn't reach a prompt. Asked of the PTY
+    /// directly: the polled `foreground` can be a moment behind.
+    pub fn is_busy(&self) -> bool {
+        self.log.is_running()
+            || self
+                .session
+                .as_ref()
+                .and_then(|s| s.foreground_process())
+                .is_some_and(|f| !f.is_shell())
+    }
+
     // --- Copy mode (vi scrollback navigation) ---
 
     /// Which copy sub-mode is active, if any.
@@ -2348,33 +2360,53 @@ impl TerminalPane {
         self.scroll_accum -= lines as f32;
 
         let mode = *session.term.lock().mode();
-        if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
-            // Alt-screen apps with alternate scroll get arrow keys, otherwise
-            // scrolling in vim/less does nothing.
-            let seq: &[u8] = if lines > 0 { b"\x1bOA" } else { b"\x1bOB" };
-            let seq = if mode.contains(TermMode::APP_CURSOR) {
-                seq.to_vec()
-            } else if lines > 0 {
-                b"\x1b[A".to_vec()
-            } else {
-                b"\x1b[B".to_vec()
-            };
-            let mut bytes = Vec::new();
-            for _ in 0..lines.abs() {
-                bytes.extend_from_slice(&seq);
-            }
-            session.write_input(bytes);
-        } else if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
-            if let Some((_, _, col, row)) = self.grid_point(event.position) {
-                let button = if lines > 0 { 64 } else { 65 };
-                for _ in 0..lines.abs() {
-                    self.send_mouse_report(button, col, row, true, &event.modifiers);
+        match wheel_target(mode, event.modifiers.shift) {
+            WheelTarget::Report => {
+                if let Some((_, _, col, row)) = self.grid_point(event.position) {
+                    let button = if lines > 0 { 64 } else { 65 };
+                    for _ in 0..lines.abs() {
+                        self.send_mouse_report(button, col, row, true, &event.modifiers);
+                    }
                 }
             }
-        } else {
-            session.term.lock().scroll_display(Scroll::Delta(lines));
-            cx.notify();
+            WheelTarget::Arrows => {
+                let seq: &[u8] = match (mode.contains(TermMode::APP_CURSOR), lines > 0) {
+                    (true, true) => b"\x1bOA",
+                    (true, false) => b"\x1bOB",
+                    (false, true) => b"\x1b[A",
+                    (false, false) => b"\x1b[B",
+                };
+                session.write_input(seq.repeat(lines.unsigned_abs() as usize));
+            }
+            WheelTarget::Scrollback => {
+                session.term.lock().scroll_display(Scroll::Delta(lines));
+                cx.notify();
+            }
         }
+    }
+}
+
+/// What the scroll wheel drives.
+#[derive(Debug, PartialEq, Eq)]
+enum WheelTarget {
+    /// The program tracks the mouse: it gets wheel button reports.
+    Report,
+    /// An alt-screen program that doesn't (less, man): arrow keys, or the
+    /// wheel would do nothing there.
+    Arrows,
+    Scrollback,
+}
+
+/// Mouse reporting is asked first. Alternate scroll is on by default, so
+/// asking it first sent arrows to every alt-screen program — and the wheel
+/// moved the cursor in neovim and lazygit instead of scrolling the view.
+fn wheel_target(mode: TermMode, shift: bool) -> WheelTarget {
+    if mode.intersects(TermMode::MOUSE_MODE) && !shift {
+        WheelTarget::Report
+    } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+        WheelTarget::Arrows
+    } else {
+        WheelTarget::Scrollback
     }
 }
 
@@ -2444,8 +2476,6 @@ impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
         let theme = self.theme.clone();
-        let mut bg = theme.background;
-        bg.a = self.config.window.opacity.clamp(0.1, 1.0);
         let vi_mode = self.vi_mode();
         let vi_count = self.vi_count();
         let scrolled_lines = self.last_layout.map(|l| l.display_offset).unwrap_or(0);
@@ -2463,7 +2493,8 @@ impl Render for TerminalPane {
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(bg)
+            // No background of its own: the window paints one behind every
+            // pane, at `window.opacity`.
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::select_all))
@@ -2710,5 +2741,26 @@ mod search_tests {
         assert_eq!(group_thousands(1000), "1,000");
         assert_eq!(group_thousands(2340), "2,340");
         assert_eq!(group_thousands(1234567), "1,234,567");
+    }
+}
+
+#[cfg(test)]
+mod wheel_tests {
+    use super::*;
+
+    #[test]
+    fn a_program_tracking_the_mouse_gets_the_wheel_not_arrows() {
+        let alt = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        // neovim, lazygit: alt screen with mouse reporting on.
+        let tracking = alt | TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(wheel_target(tracking, false), WheelTarget::Report);
+        // shift takes the wheel back from the program.
+        assert_eq!(wheel_target(tracking, true), WheelTarget::Arrows);
+        // less, man: alt screen, no mouse.
+        assert_eq!(wheel_target(alt, false), WheelTarget::Arrows);
+        assert_eq!(
+            wheel_target(TermMode::ALTERNATE_SCROLL, false),
+            WheelTarget::Scrollback
+        );
     }
 }

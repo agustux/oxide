@@ -11,6 +11,79 @@ write for users: what changed and why it matters, not which files moved.
 
 ## [Unreleased]
 
+### Added
+
+- Drag a file or directory in the file tree to move it: drop it on a
+  directory to move it inside, on a file to move it beside that file, or on
+  the empty space below the rows to move it to the tree's root. Nothing is
+  overwritten, same as `m`.
+- Drag a workspace in the drawer to reorder it, the way tabs already work.
+  `cmd-alt-1..9` follow the new order, and so do pinned workspaces after a
+  restart.
+- Drag the drawer's right edge to resize it. The width is remembered across
+  launches; changing `tree.width` in the config resets it.
+- `markdown.preview_in = "tab" | "split"` chooses where a markdown preview
+  opens. `"split"` puts it beside the pane you're in, laid out for that
+  narrower width. The default is still a new tab.
+- `editor.open_in = "tab" | "split"` chooses where a file opens when the
+  focused pane can't take it (see Fixed). The default is a new tab.
+
+### Changed
+
+- The markdown preview (and Help → What's New) now reads all of markdown,
+  not the subset it used to. New: ~~strikethrough~~, `_underscore_`
+  emphasis, lists nested to any depth with paragraphs and code inside
+  their items, numbered lists that keep their numbers, quotes inside
+  quotes, GitHub's `> [!NOTE]` alerts, footnotes, reference-style links,
+  `<https://…>` autolinks, headings underlined with `===`, indented code
+  blocks, definition lists, YAML front matter, and backslash escapes.
+  Styles nest properly, so a bold or struck-through sentence with `code` in
+  it stays bold or struck through to its end. Long lines wrap under their
+  own text instead of back at the left edge, and blocks are set apart by a
+  blank line.
+- Adding, renaming, and moving in the file tree, and adding and renaming
+  workspaces, now ask for the name in a small modal in the middle of the
+  window, titled with what you're doing ("Rename main.rs"), instead of a
+  line squeezed into the drawer's footer. Renaming a tab uses the same one.
+  The tree's `/` filter stays in the drawer, next to the rows it filters.
+
+### Fixed
+
+- The scroll wheel scrolls the view in Neovim, LazyGit, and other programs
+  that track the mouse. It was being sent as arrow keys, so it moved the
+  cursor instead. Programs that don't track the mouse (`less`, `man`) still
+  get arrow keys, and shift + scroll still bypasses the program.
+- Opening a second file from the file tree, the file finder, or a
+  `cmd-click` while a terminal editor still has the first one open no longer
+  does nothing. The file opens in a new tab (or a split, with
+  `editor.open_in`) that closes when you quit the editor. The same goes for
+  Open Settings, and for any pane that's busy running something else.
+- macOS: `window.blur = true` blurs what's behind a translucent window
+  again. On recent macOS it did nothing, and windows behind Oxide showed
+  through sharp.
+- `window.opacity` now applies to the whole window evenly. The file tree,
+  tab bar, and status bar used to stay solid while the workspaces panel was
+  more see-through than the terminal. The terminal also came out more
+  opaque than the number you set (0.5 looked like 0.75); it now matches, so
+  an existing setting will look a little more transparent than before.
+  Panes dimmed by `window.inactive_pane_opacity` stay as see-through as the
+  focused one: only their contents fade, where before the dimming also made
+  them more solid.
+  The active tab is the same: lighter than the bar, not more solid.
+  Opening the command palette or any other modal no longer turns a
+  translucent window dark and solid; the modal simply sits on top.
+- Changing `window.opacity` or `window.blur` in the config applies to open
+  windows straight away, including going between solid and translucent.
+  That used to need a restart.
+- A markdown preview or What's New page shorter than the pane opens at the
+  top of it, not pushed down to the bottom.
+- Text fields have a real cursor and word editing everywhere: the command
+  palette, command history, file finder, startup commands, the tree filter,
+  and the new prompt modal. Option+Left/Right move by word, Option+Delete
+  deletes the word before the cursor, Cmd+Left/Right jump to the ends, and
+  Cmd+Delete clears back to the start (Ctrl+arrows and Ctrl+Backspace on
+  Linux). Before, most of these fields could only append and backspace.
+
 ## [0.6.3] - 2026-09-26
 
 ### Fixed

@@ -1,13 +1,17 @@
 //! Markdown rendered to ANSI for paging with `less -R` in a terminal tab.
-//! Small and line-based: headings, lists, task boxes, quotes, rules, boxed
-//! and highlighted code fences with a "copy" link, tables laid out to the
-//! tab's width, the HTML that READMEs lean on, and inline `code`, **bold**,
-//! *italic*, [links].
+//! pulldown-cmark parses — CommonMark, plus GitHub's tables, task lists,
+//! strikethrough, footnotes, and alerts — and this module draws: text
+//! wrapped under its own bullet or quote bar, code boxed and highlighted
+//! with a "copy" link, tables laid out to the tab's width, and the HTML
+//! that READMEs lean on.
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use pulldown_cmark::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color, FontStyle, StyleModifier, Theme, ThemeItem, ThemeSettings};
 use syntect::parsing::SyntaxSet;
@@ -17,6 +21,7 @@ const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const ITALIC: &str = "\x1b[3m";
 const UNDERLINE: &str = "\x1b[4m";
+const STRIKE: &str = "\x1b[9m";
 const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
 const RESET: &str = "\x1b[0m";
@@ -28,7 +33,7 @@ const COPY_LABEL: &str = " ⧉ copy ";
 
 pub struct Rendered {
     pub text: String,
-    /// Each fenced code block as written, for its "copy" link.
+    /// Each code block as written, for its "copy" link.
     pub code: Vec<String>,
 }
 
@@ -61,174 +66,524 @@ pub fn is_markdown(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
 }
 
-/// A source line after the HTML pass, or a whole fenced code block.
-enum Item {
-    Text { line: String, centered: bool },
-    Code { lang: String, lines: Vec<String> },
-}
-
 pub fn render(md: &str, width: usize) -> Rendered {
-    let width = width.max(20);
-    let items = preprocess(md);
-    let mut out = String::with_capacity(md.len() * 2);
-    let mut code = Vec::new();
-    let mut i = 0;
-    while i < items.len() {
-        let item = &items[i];
-        i += 1;
-        let (line, centered) = match item {
-            Item::Code { lang, lines } => {
-                code_block(&mut out, lang, lines, code.len(), width);
-                // No trailing newline: pasted at a prompt, it would run.
-                code.push(lines.join("\n"));
-                continue;
-            }
-            Item::Text { line, centered } => (line.as_str(), *centered),
-        };
-        // A header row, then a `|---|---|` row, then the body.
-        if line.contains('|')
-            && let Some(Item::Text { line: rule, .. }) = items.get(i)
-            && let Some(aligns) = table_aligns(rule)
-        {
-            let mut rows = vec![cells(line)];
-            i += 1;
-            while let Some(Item::Text { line, .. }) = items.get(i)
-                && line.contains('|')
-            {
-                rows.push(cells(line));
-                i += 1;
-            }
-            table(&mut out, &rows, &aligns, width);
-            continue;
-        }
-        // Tag-only lines become blanks; don't let them pile up.
-        if line.trim().is_empty() {
-            if !out.is_empty() && !out.ends_with("\n\n") {
-                out.push('\n');
-            }
-            continue;
-        }
-        let rendered = if centered {
-            let text = render_line(line.trim());
-            let pad = width.saturating_sub(visible_width(&text)) / 2;
-            format!("{}{text}", " ".repeat(pad))
-        } else {
-            render_line(line)
-        };
-        out.push_str(&rendered);
-        out.push('\n');
-    }
-    Rendered { text: out, code }
-}
-
-fn render_line(line: &str) -> String {
-    let trimmed = line.trim_start();
-    let indent = &line[..line.len() - trimmed.len()];
-    if is_rule(trimmed) {
-        format!("{DIM}{}{RESET}", "─".repeat(40))
-    } else if let Some((level, text)) = heading(trimmed) {
-        let style = match level {
-            1 => format!("{BOLD}{UNDERLINE}"),
-            2 => format!("{BOLD}{CYAN}"),
-            3 => format!("{BOLD}{YELLOW}"),
-            _ => BOLD.to_string(),
-        };
-        format!("{style}{}{RESET}", inline(text))
-    } else if let Some(item) = ["- ", "* ", "+ "]
-        .iter()
-        .find_map(|b| trimmed.strip_prefix(b))
-    {
-        let (bullet, item) = if let Some(rest) = item.strip_prefix("[ ] ") {
-            ("☐", rest)
-        } else if let Some(rest) = item
-            .strip_prefix("[x] ")
-            .or_else(|| item.strip_prefix("[X] "))
-        {
-            ("☑", rest)
-        } else {
-            ("•", item)
-        };
-        format!("{indent}  {bullet} {}", inline(item))
-    } else if let Some(quote) = trimmed.strip_prefix('>') {
-        format!("{indent}{DIM}│{RESET} {}", inline(quote.trim_start()))
-    } else {
-        inline(line)
+    let mut renderer = Renderer {
+        width: width.max(20),
+        ..Default::default()
+    };
+    renderer.blocks(md, false);
+    Rendered {
+        text: renderer.out,
+        code: renderer.code,
     }
 }
 
-// --- Pass one: fences set aside, HTML turned into markdown ---
+/// What the parser is asked to recognise beyond CommonMark. Not math or
+/// smart punctuation: a preview shouldn't restyle `$5` or retype quotes.
+fn extensions() -> Options {
+    Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_GFM
+        | Options::ENABLE_DEFINITION_LIST
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+}
 
-fn preprocess(md: &str) -> Vec<Item> {
-    let mut items = Vec::new();
-    let mut html = Html::default();
-    // The open fence: its marker and how far it was indented.
-    let mut fence: Option<(&str, usize)> = None;
-    for line in md.lines() {
-        let trimmed = line.trim_start();
-        if let Some((marker, indent)) = fence {
-            let t = trimmed.trim_end();
-            if t.len() >= marker.len() && t.chars().all(|c| marker.starts_with(c)) {
-                fence = None;
-            } else if let Some(Item::Code { lines, .. }) = items.last_mut() {
-                // Verbatim, minus the indentation the fence itself had.
-                let strip = line.len() - line.trim_start_matches(' ').len();
-                lines.push(line[strip.min(indent)..].replace('\t', "    "));
+/// Text from the file, made safe to show: an escape character would be the
+/// file driving the terminal, and a tab has no width to wrap by.
+fn clean(text: &str) -> String {
+    text.replace('\x1b', "␛").replace('\t', "    ")
+}
+
+/// A block that holds other blocks — a list item, a quote, a footnote —
+/// as what it puts in front of their rows.
+struct Frame {
+    /// Before its first row: the bullet, the number.
+    first: String,
+    /// Before the rest, as wide as `first`, so text wraps under text.
+    rest: String,
+    /// `first` has been drawn.
+    used: bool,
+    item: bool,
+    /// An item whose text is in paragraphs, which stand apart.
+    loose: bool,
+}
+
+impl Frame {
+    fn new(first: String, item: bool) -> Self {
+        Self {
+            rest: " ".repeat(visible_width(&first)),
+            first,
+            used: false,
+            item,
+            loose: false,
+        }
+    }
+}
+
+/// Walks the parser's events, gathering each block's text and drawing it
+/// when the block ends.
+#[derive(Default)]
+struct Renderer {
+    width: usize,
+    out: String,
+    code: Vec<String>,
+    /// Open containers, outermost first.
+    frames: Vec<Frame>,
+    /// A blank row is owed before the next block.
+    gap: bool,
+    /// The text of the block being gathered, styled.
+    text: String,
+    /// Styles open around the end of `text`, outermost first.
+    styles: Vec<String>,
+    /// Open links: where each one's text starts in `text`, and its target.
+    links: Vec<(usize, String)>,
+    /// Open images: where each one's alt text starts in `text`.
+    images: Vec<usize>,
+    /// Open lists: the next number, for the ordered ones.
+    lists: Vec<Option<u64>>,
+    /// The code block being gathered: its language and its text.
+    verbatim: Option<(String, String)>,
+    /// The table being gathered: column alignments, and rows of cells.
+    table: Option<(Vec<Align>, Vec<Vec<String>>)>,
+    html_block: String,
+    html: Html,
+    /// Inside an HTML block's own text: whether that run is centered.
+    /// Outside one, `html` says.
+    centered: Option<bool>,
+}
+
+impl Renderer {
+    /// Render `md` into `out`. `nested` is the text of an HTML block, which
+    /// has had its HTML turned into markdown already: what is left in angle
+    /// brackets is shown as written.
+    fn blocks(&mut self, md: &str, nested: bool) {
+        for event in Parser::new_ext(md, extensions()) {
+            match event {
+                Event::Start(tag) => self.start(tag),
+                Event::End(tag) => self.end(tag, nested),
+                Event::Text(text) => match &mut self.verbatim {
+                    Some((_, code)) => code.push_str(&text),
+                    None => self.text.push_str(&clean(&text)),
+                },
+                Event::Code(code) | Event::InlineMath(code) | Event::DisplayMath(code) => {
+                    self.span(CYAN, &clean(&code))
+                }
+                Event::Html(html) => self.html_block.push_str(&html),
+                Event::InlineHtml(html) => self.inline_html(&html),
+                Event::FootnoteReference(label) => self.span(DIM, &format!("[{}]", clean(&label))),
+                Event::SoftBreak => self.text.push(' '),
+                Event::HardBreak => self.text.push('\n'),
+                Event::Rule => {
+                    self.flush();
+                    let rule = "─".repeat(self.room().min(40));
+                    self.emit([format!("{DIM}{rule}{RESET}")]);
+                    self.gap = true;
+                }
+                Event::TaskListMarker(done) => {
+                    if let Some(item) = self.frames.iter_mut().rev().find(|f| f.item) {
+                        item.first = item.first.replace('•', if done { "☑" } else { "☐" });
+                    }
+                }
             }
-        } else if let Some(marker) = fence_marker(trimmed) {
-            fence = Some((marker, line.len() - trimmed.len()));
-            items.push(Item::Code {
-                lang: trimmed[marker.len()..].trim().to_string(),
-                lines: Vec::new(),
-            });
-        } else {
-            let was_centered = html.center.is_some();
-            let converted = html.convert(line);
-            let centered = was_centered || html.centered_here;
+        }
+        self.flush();
+    }
+
+    fn start(&mut self, tag: Tag) {
+        match tag {
+            Tag::Emphasis => self.open(ITALIC),
+            Tag::Strong => self.open(BOLD),
+            Tag::Strikethrough => self.open(STRIKE),
+            Tag::Superscript | Tag::Subscript => {}
+            Tag::Link { dest_url, .. } => self.open_link(&dest_url),
+            Tag::Image { .. } => self.images.push(self.text.len()),
+            Tag::TableHead | Tag::TableRow => {
+                if let Some((_, rows)) = &mut self.table {
+                    rows.push(Vec::new());
+                }
+            }
+            Tag::TableCell => self.text.clear(),
+            // Everything else opens a block, which ends the one before it:
+            // a list item's own text, when a list starts inside it.
+            block => {
+                self.flush();
+                self.start_block(block);
+            }
+        }
+    }
+
+    fn start_block(&mut self, tag: Tag) {
+        match tag {
+            Tag::Heading { level, .. } => self.open(&match level {
+                HeadingLevel::H1 => format!("{BOLD}{UNDERLINE}"),
+                HeadingLevel::H2 => format!("{BOLD}{CYAN}"),
+                HeadingLevel::H3 => format!("{BOLD}{YELLOW}"),
+                _ => BOLD.to_string(),
+            }),
+            Tag::DefinitionListTitle => self.open(BOLD),
+            Tag::BlockQuote(kind) => {
+                let bar = format!("{DIM}│{RESET} ");
+                self.frames.push(Frame {
+                    rest: bar.clone(),
+                    ..Frame::new(bar, false)
+                });
+                // GitHub's alerts: `> [!NOTE]`.
+                let label = match kind {
+                    Some(BlockQuoteKind::Note) => Some(("\x1b[34m", "Note")),
+                    Some(BlockQuoteKind::Tip) => Some(("\x1b[32m", "Tip")),
+                    Some(BlockQuoteKind::Important) => Some(("\x1b[35m", "Important")),
+                    Some(BlockQuoteKind::Warning) => Some((YELLOW, "Warning")),
+                    Some(BlockQuoteKind::Caution) => Some(("\x1b[31m", "Caution")),
+                    None => None,
+                };
+                if let Some((color, name)) = label {
+                    self.emit([format!("{BOLD}{color}{name}{RESET}")]);
+                }
+            }
+            Tag::CodeBlock(kind) => {
+                let lang = match kind {
+                    CodeBlockKind::Fenced(info) => info.to_string(),
+                    CodeBlockKind::Indented => String::new(),
+                };
+                self.verbatim = Some((lang, String::new()));
+            }
+            // Front matter, shown as what it is.
+            Tag::MetadataBlock(_) => self.verbatim = Some(("yaml".into(), String::new())),
+            Tag::List(start) => self.lists.push(start),
+            Tag::Item => {
+                let marker = match self.lists.last_mut() {
+                    Some(Some(number)) => {
+                        *number += 1;
+                        format!("{}. ", *number - 1)
+                    }
+                    _ => "• ".to_string(),
+                };
+                // Only the outermost list stands in from the margin; a list
+                // inside an item starts under that item's text.
+                let lead = if self.frames.iter().any(|f| f.item) {
+                    ""
+                } else {
+                    "  "
+                };
+                self.frames
+                    .push(Frame::new(format!("{lead}{marker}"), true));
+            }
+            Tag::FootnoteDefinition(label) => {
+                let label = format!("{DIM}[{}]{RESET} ", clean(&label));
+                self.frames.push(Frame::new(label, false));
+            }
+            Tag::DefinitionListDefinition => self.frames.push(Frame::new("    ".into(), false)),
+            Tag::Table(aligns) => {
+                let aligns = aligns
+                    .iter()
+                    .map(|a| match a {
+                        Alignment::Center => Align::Center,
+                        Alignment::Right => Align::Right,
+                        Alignment::None | Alignment::Left => Align::Left,
+                    })
+                    .collect();
+                self.table = Some((aligns, Vec::new()));
+            }
+            Tag::HtmlBlock => self.html_block.clear(),
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, tag: TagEnd, nested: bool) {
+        match tag {
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.close(),
+            TagEnd::Superscript | TagEnd::Subscript => {}
+            TagEnd::Link => self.close_link(),
+            TagEnd::Image => {
+                // Whatever styling the alt text had, it is a label now.
+                if let Some(start) = self.images.pop() {
+                    let alt = plain(&self.text.split_off(start));
+                    let sep = if alt.is_empty() { "" } else { ": " };
+                    self.span(ITALIC, &format!("[image{sep}{alt}]"));
+                }
+            }
+            TagEnd::TableCell => {
+                let cell = std::mem::take(&mut self.text);
+                if let Some((_, rows)) = &mut self.table
+                    && let Some(row) = rows.last_mut()
+                {
+                    row.push(cell);
+                }
+            }
+            TagEnd::TableHead | TagEnd::TableRow => {}
+            TagEnd::Heading(_) => {
+                self.close();
+                self.flush();
+                self.gap = true;
+            }
+            // Its definition follows directly.
+            TagEnd::DefinitionListTitle => {
+                self.close();
+                self.flush();
+            }
+            TagEnd::Paragraph => {
+                self.flush();
+                self.gap = true;
+                if let Some(item) = self.frames.iter_mut().rev().find(|f| f.item) {
+                    item.loose = true;
+                }
+            }
+            TagEnd::DefinitionList => self.gap = true,
+            TagEnd::CodeBlock | TagEnd::MetadataBlock(_) => {
+                if let Some((lang, code)) = self.verbatim.take() {
+                    let lines: Vec<String> = code.lines().map(clean).collect();
+                    let mut boxed = String::new();
+                    code_block(&mut boxed, &lang, &lines, self.code.len(), self.room());
+                    // No trailing newline: pasted at a prompt, it would run.
+                    self.code.push(lines.join("\n"));
+                    self.emit(boxed.lines());
+                }
+                self.gap = true;
+            }
+            TagEnd::Table => {
+                if let Some((aligns, rows)) = self.table.take() {
+                    let mut drawn = String::new();
+                    table(&mut drawn, &rows, &aligns, self.room());
+                    self.emit(drawn.lines());
+                }
+                self.gap = true;
+            }
+            TagEnd::HtmlBlock => self.end_html_block(nested),
+            TagEnd::List(_) => {
+                self.flush();
+                self.lists.pop();
+                // A list inside an item is part of the item: it stands
+                // apart from what follows only if the item's text does.
+                let item = self.frames.iter().rev().find(|f| f.item);
+                self.gap = item.is_none_or(|item| item.loose);
+            }
+            TagEnd::Item => {
+                self.flush();
+                // An item with nothing in it still has its bullet.
+                if self.frames.last().is_some_and(|f| !f.used) {
+                    self.emit([""]);
+                }
+                self.frames.pop();
+            }
+            TagEnd::BlockQuote(_)
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionListDefinition => {
+                self.flush();
+                self.frames.pop();
+                self.gap = true;
+            }
+        }
+    }
+
+    // --- Inline: styles nest, and a reset ends them all ---
+
+    fn outer(&self) -> String {
+        self.styles.concat()
+    }
+
+    fn open(&mut self, style: &str) {
+        self.text.push_str(style);
+        self.styles.push(style.to_string());
+    }
+
+    /// End the innermost style. The only way to end one is to reset them
+    /// all, so the ones around it are opened again — or code inside bold
+    /// would leave the rest of the bold plain.
+    fn close(&mut self) {
+        self.styles.pop();
+        self.text.push_str(RESET);
+        self.text.push_str(&self.outer());
+    }
+
+    fn span(&mut self, style: &str, text: &str) {
+        self.open(style);
+        self.text.push_str(text);
+        self.close();
+    }
+
+    fn open_link(&mut self, target: &str) {
+        self.links.push((self.text.len(), clean(target)));
+        self.open(UNDERLINE);
+    }
+
+    /// The URL goes after the text, where it can be cmd-clicked — unless
+    /// the text is the URL, or it points within the page, which is nowhere
+    /// in a pager.
+    fn close_link(&mut self) {
+        self.close();
+        if let Some((start, url)) = self.links.pop()
+            && !url.is_empty()
+            && !url.starts_with('#')
+            && url.trim_start_matches("mailto:") != plain(&self.text[start..])
+        {
+            self.text.push(' ');
+            self.span(DIM, &format!("({url})"));
+        }
+    }
+
+    /// A tag in running text: the ones with a style get it, the rest of the
+    /// ones we know are dropped, and anything else in angle brackets is
+    /// text — `Vec<String>` is not markup.
+    fn inline_html(&mut self, html: &str) {
+        if html.starts_with("<!--") {
+            return;
+        }
+        let Some((name, closing, attrs, _)) = parse_tag(html) else {
+            self.text.push_str(&clean(html));
+            return;
+        };
+        let style = match name.as_str() {
+            "strong" | "b" => BOLD,
+            "em" | "i" => ITALIC,
+            "code" | "kbd" | "samp" | "tt" => CYAN,
+            "del" | "s" => STRIKE,
+            "u" | "ins" => UNDERLINE,
+            "br" => return self.text.push('\n'),
+            "img" => {
+                let alt = clean(attr(attrs, "alt").unwrap_or(""));
+                let sep = if alt.is_empty() { "" } else { ": " };
+                return self.span(ITALIC, &format!("[image{sep}{alt}]"));
+            }
+            "a" if closing => {
+                if !self.links.is_empty() {
+                    self.close_link();
+                }
+                return;
+            }
+            "a" => return self.open_link(attr(attrs, "href").unwrap_or("")),
+            _ => return,
+        };
+        if !closing {
+            self.open(style);
+        } else if self.styles.last().is_some_and(|open| open == style) {
+            self.close();
+        }
+    }
+
+    // --- Blocks ---
+
+    /// Columns left for a block's rows inside the containers it is in.
+    fn room(&self) -> usize {
+        let taken: usize = self.frames.iter().map(|f| visible_width(&f.rest)).sum();
+        self.width.saturating_sub(taken).max(10)
+    }
+
+    /// Draw the text gathered so far as a block of its own, wrapped.
+    fn flush(&mut self) {
+        let text = std::mem::take(&mut self.text);
+        if visible_width(text.trim()) > 0 {
+            self.emit(wrap(text.trim_end(), self.room(), true));
+        }
+    }
+
+    /// Write a block's rows, each behind what its containers put in front.
+    fn emit<S: AsRef<str>>(&mut self, rows: impl IntoIterator<Item = S>) {
+        let centered = self.centered.unwrap_or_else(|| self.html.center.is_some());
+        let room = self.room();
+        for row in rows {
+            let row = row.as_ref();
+            if std::mem::take(&mut self.gap) && !self.out.is_empty() {
+                // Drawn by the containers already begun: a quote's bar
+                // runs on, the bullet still to come does not.
+                let open: String = self
+                    .frames
+                    .iter()
+                    .filter(|f| f.used)
+                    .map(|f| f.rest.as_str())
+                    .collect();
+                self.out.push_str(open.trim_end());
+                self.out.push('\n');
+            }
+            for frame in &mut self.frames {
+                self.out
+                    .push_str(if std::mem::replace(&mut frame.used, true) {
+                        &frame.rest
+                    } else {
+                        &frame.first
+                    });
+            }
+            if centered {
+                let pad = room.saturating_sub(visible_width(row)) / 2;
+                self.out.push_str(&" ".repeat(pad));
+            }
+            self.out.push_str(row);
+            self.out.push('\n');
+        }
+    }
+
+    /// An HTML block, by CommonMark, is left as written — markdown inside
+    /// it included. READMEs put their headers in one, so its HTML is turned
+    /// into markdown and rendered: each run of lines, centered or not, as a
+    /// document of its own.
+    fn end_html_block(&mut self, nested: bool) {
+        let block = std::mem::take(&mut self.html_block);
+        if nested {
+            self.text.push_str(&clean(block.trim()));
+            self.flush();
+            self.gap = true;
+            return;
+        }
+        let mut runs: Vec<(bool, String)> = Vec::new();
+        for line in block.lines() {
+            let was_centered = self.html.center.is_some();
+            let converted = self.html.convert(line);
+            let centered = was_centered || self.html.centered_here;
             // A `<br>` that ends the line breaks it once, not twice.
             let converted = converted.strip_suffix('\n').unwrap_or(&converted);
-            for line in converted.split('\n') {
-                items.push(Item::Text {
-                    line: line.to_string(),
-                    centered,
-                });
+            // Indentation was the HTML's. Kept, four spaces of it would
+            // make the line a code block.
+            let line: Vec<&str> = converted.split('\n').map(str::trim_start).collect();
+            let line = line.join("\n");
+            match runs.last_mut() {
+                Some((run, text)) if *run == centered => {
+                    text.push_str(&line);
+                    text.push('\n');
+                }
+                _ => runs.push((centered, line + "\n")),
             }
         }
+        for (centered, text) in runs {
+            self.centered = Some(centered);
+            self.blocks(&text, true);
+        }
+        self.centered = None;
+        self.gap = true;
     }
-    items
 }
 
-/// The run of three or more backticks or tildes that opens a code fence.
-fn fence_marker(trimmed: &str) -> Option<&str> {
-    let c = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'))?;
-    let len = trimmed.chars().take_while(|&x| x == c).count();
-    (len >= 3).then(|| &trimmed[..len])
-}
+// --- HTML ---
 
 /// Tags worth understanding. Anything else in angle brackets is left alone,
 /// so `Vec<String>` in prose survives.
 #[rustfmt::skip]
 const TAGS: &[&str] = &[
-    "a", "b", "blockquote", "br", "center", "code", "details", "div", "em", "h1", "h2", "h3",
-    "h4", "h5", "h6", "hr", "i", "img", "kbd", "li", "ol", "p", "picture", "samp", "source",
-    "span", "strong", "sub", "summary", "sup", "table", "tbody", "td", "th", "thead", "tr",
-    "tt", "ul",
+    "a", "b", "blockquote", "br", "center", "code", "del", "details", "div", "em", "h1", "h2",
+    "h3", "h4", "h5", "h6", "hr", "i", "img", "ins", "kbd", "li", "ol", "p", "picture", "s",
+    "samp", "source", "span", "strong", "sub", "summary", "sup", "table", "tbody", "td", "th",
+    "thead", "tr", "tt", "u", "ul",
 ];
 
-const ENTITIES: &[(&str, &str)] = &[
-    ("&amp;", "&"),
-    ("&lt;", "<"),
-    ("&gt;", ">"),
-    ("&quot;", "\""),
-    ("&apos;", "'"),
-    ("&#39;", "'"),
-    ("&nbsp;", " "),
-    ("&mdash;", "—"),
-    ("&ndash;", "–"),
-    ("&hellip;", "…"),
-    ("&rarr;", "→"),
-    ("&larr;", "←"),
-    ("&copy;", "©"),
-];
+/// For text opening with a tag we know: its name, whether it is a closing
+/// tag, its attributes, and its length in bytes.
+fn parse_tag(text: &str) -> Option<(String, bool, &str, usize)> {
+    let end = text.find('>')?;
+    let body = text.strip_prefix('<')?.get(..end - 1)?;
+    let (closing, body) = body.strip_prefix('/').map_or((false, body), |b| (true, b));
+    let name_len = body
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric())
+        .count();
+    let (name, attrs) = body.split_at(name_len);
+    let name = name.to_ascii_lowercase();
+    let known = TAGS.contains(&name.as_str())
+        && attrs
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || c == '/');
+    known.then_some((name, closing, attrs, end + 1))
+}
 
 /// HTML state that outlives a line.
 #[derive(Default)]
@@ -243,8 +598,9 @@ struct Html {
 }
 
 impl Html {
-    /// Rewrite the HTML in a line as the markdown the renderer understands.
-    /// `<br>` yields a `\n`; inline code spans are left untouched.
+    /// Rewrite the HTML in a line of an HTML block as markdown, for the
+    /// parser to take from there (entities included: it decodes those).
+    /// `<br>` yields a hard break; inline code spans are left untouched.
     fn convert(&mut self, line: &str) -> String {
         let mut out = String::with_capacity(line.len());
         let mut rest = line;
@@ -271,14 +627,6 @@ impl Html {
                     rest = &rest[len..];
                     continue;
                 }
-                if c == '&'
-                    && let Some((from, to)) =
-                        ENTITIES.iter().find(|(from, _)| rest.starts_with(from))
-                {
-                    out.push_str(to);
-                    rest = &rest[from.len()..];
-                    continue;
-                }
             }
             out.push(c);
             rest = &rest[c.len_utf8()..];
@@ -288,24 +636,7 @@ impl Html {
 
     /// Handle a known tag at the start of `rest`; returns its byte length.
     fn tag(&mut self, rest: &str, out: &mut String) -> Option<usize> {
-        let end = rest.find('>')?;
-        let body = &rest[1..end];
-        let (closing, body) = body.strip_prefix('/').map_or((false, body), |b| (true, b));
-        let name_len = body
-            .bytes()
-            .take_while(|b| b.is_ascii_alphanumeric())
-            .count();
-        let (name, attrs) = body.split_at(name_len);
-        let name = name.to_ascii_lowercase();
-        if !TAGS.contains(&name.as_str())
-            || !attrs
-                .chars()
-                .next()
-                .is_none_or(|c| c.is_whitespace() || c == '/')
-        {
-            return None;
-        }
-
+        let (name, closing, attrs, len) = parse_tag(rest)?;
         if closing {
             if self.center.as_deref() == Some(&name) {
                 self.center = None;
@@ -323,6 +654,7 @@ impl Html {
             }
             ("strong" | "b", _) => out.push_str("**"),
             ("em" | "i", _) => out.push('*'),
+            ("del" | "s", _) => out.push_str("~~"),
             ("code" | "kbd" | "samp" | "tt", _) => out.push('`'),
             ("summary", false) => out.push_str("**▸ "),
             ("summary", true) => out.push_str("**"),
@@ -345,10 +677,11 @@ impl Html {
             ("li", false) if starts_line => out.push_str("- "),
             ("hr", _) if starts_line => out.push_str("---"),
             ("blockquote", false) if starts_line => out.push_str("> "),
-            ("br", _) => out.push('\n'),
+            // Two spaces before the newline: a break that holds.
+            ("br", _) => out.push_str("  \n"),
             _ => {}
         }
-        Some(end + 1)
+        Some(len)
     }
 }
 
@@ -361,28 +694,7 @@ fn attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
     Some(&rest[..rest.find(quote)?])
 }
 
-// --- Blocks ---
-
-/// `---`, `***`, `___`, optionally spaced out.
-fn is_rule(trimmed: &str) -> bool {
-    let mut marks = trimmed.chars().filter(|c| !c.is_whitespace());
-    let Some(first) = marks.next().filter(|c| matches!(c, '-' | '*' | '_')) else {
-        return false;
-    };
-    let mut count = 1;
-    marks.all(|c| {
-        count += 1;
-        c == first
-    }) && count >= 3
-}
-
-fn heading(trimmed: &str) -> Option<(usize, &str)> {
-    let level = trimmed.chars().take_while(|&c| c == '#').count();
-    let text = trimmed[level..].strip_prefix(' ')?;
-    (1..=6)
-        .contains(&level)
-        .then(|| (level, text.trim_end_matches([' ', '#'])))
-}
+// --- Code ---
 
 /// A box around the code: the language and a "copy" link on its top edge,
 /// the code highlighted when the language is known. Lines too long for the
@@ -549,64 +861,18 @@ enum Align {
     Right,
 }
 
-/// Column alignments if `line` is a table's `|:--|--:|` delimiter row.
-fn table_aligns(line: &str) -> Option<Vec<Align>> {
-    if !line.contains('|') {
-        return None;
-    }
-    cells(line)
-        .iter()
-        .map(|c| {
-            let dashes = c.trim_start_matches(':').trim_end_matches(':');
-            (!dashes.is_empty() && dashes.chars().all(|d| d == '-')).then(|| {
-                match (c.starts_with(':'), c.ends_with(':')) {
-                    (true, true) => Align::Center,
-                    (false, true) => Align::Right,
-                    _ => Align::Left,
-                }
-            })
-        })
-        .collect()
-}
-
-/// Split a table row on `|`, except escaped ones and those in code spans.
-fn cells(line: &str) -> Vec<String> {
-    let line = line.trim();
-    let line = line.strip_prefix('|').unwrap_or(line);
-    let mut cells = vec![String::new()];
-    let mut in_code = false;
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' if chars.peek() == Some(&'|') => {
-                chars.next();
-                cells.last_mut().unwrap().push('|');
-            }
-            '|' if !in_code => cells.push(String::new()),
-            _ => {
-                in_code ^= c == '`';
-                cells.last_mut().unwrap().push(c);
-            }
-        }
-    }
-    // The cell after a trailing pipe isn't one.
-    if cells.len() > 1 && cells.last().is_some_and(|c| c.trim().is_empty()) {
-        cells.pop();
-    }
-    cells.iter().map(|c| c.trim().to_string()).collect()
-}
-
 /// Draw a table within `width`: columns start at their natural widths and
 /// the widest give way, a column at a time, until the borders fit; cells
-/// wrap inside their column. `rows[0]` is the header.
+/// (already styled) wrap inside their column. `rows[0]` is the header.
 fn table(out: &mut String, rows: &[Vec<String>], aligns: &[Align], width: usize) {
     let n = aligns.len();
     let avail = width.saturating_sub(3 * n + 1);
+    // Every row as wide as the header, whatever the source gave it.
     let rendered: Vec<Vec<String>> = rows
         .iter()
         .map(|row| {
             (0..n)
-                .map(|c| inline(row.get(c).map_or("", |s| s)))
+                .map(|c| row.get(c).cloned().unwrap_or_default())
                 .collect()
         })
         .collect();
@@ -703,8 +969,9 @@ fn visible_width(s: &str) -> usize {
 }
 
 /// Break styled text into lines of at most `width` columns — at spaces when
-/// `at_spaces`, mid-word when there's no other way. A style that spans a
-/// break is closed on the one line and reopened on the next.
+/// `at_spaces`, mid-word when there's no other way, and wherever it has a
+/// newline. A style that spans a break is closed on the one line and
+/// reopened on the next.
 fn wrap(s: &str, width: usize, at_spaces: bool) -> Vec<String> {
     let mut lines = Vec::new();
     let (mut cur, mut cur_w) = (String::new(), 0);
@@ -726,6 +993,14 @@ fn wrap(s: &str, width: usize, at_spaces: bool) -> Vec<String> {
             continue;
         }
         rest = &rest[c.len_utf8()..];
+        if c == '\n' {
+            if !active.is_empty() {
+                cur.push_str(RESET);
+            }
+            lines.push(std::mem::replace(&mut cur, active.clone()));
+            (cur_w, space) = (0, None);
+            continue;
+        }
         if c == ' ' && at_spaces {
             if cur_w == 0 {
                 continue;
@@ -771,70 +1046,18 @@ fn wrap(s: &str, width: usize, at_spaces: bool) -> Vec<String> {
     lines
 }
 
-// --- Inline ---
-
-/// For `rest` starting at `[`: the bracketed text (brackets may nest, as in
-/// a badge: `[![alt](img)](url)`), the parenthesised target, and the tail.
-fn link(rest: &str) -> Option<(&str, &str, &str)> {
-    let mut depth = 0;
-    for (i, c) in rest.char_indices() {
-        match c {
-            '[' => depth += 1,
-            ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    let after = rest[i + 1..].strip_prefix('(')?;
-                    let end = after.find(')')?;
-                    return Some((&rest[1..i], &after[..end], &after[end + 1..]));
-                }
-            }
-            _ if depth == 0 => return None,
-            _ => {}
-        }
-    }
-    None
-}
-
-/// `code` → cyan, **bold**, *italic*, images → their alt text, and
-/// [text](url) → underlined text with the URL after it so it can be
-/// cmd-clicked.
-fn inline(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+/// What's left when the styling is gone — what the reader sees.
+fn plain(s: &str) -> String {
+    let mut out = String::new();
     let mut rest = s;
-    while !rest.is_empty() {
-        if let Some(after) = rest.strip_prefix('`')
-            && let Some(end) = after.find('`')
-        {
-            out.push_str(&format!("{CYAN}{}{RESET}", &after[..end]));
-            rest = &after[end + 1..];
-        } else if let Some(after) = rest.strip_prefix("**")
-            && let Some(end) = after.find("**")
-        {
-            out.push_str(&format!("{BOLD}{}{RESET}", inline(&after[..end])));
-            rest = &after[end + 2..];
-        } else if let Some(after) = rest.strip_prefix('*')
-            && !after.starts_with([' ', '*'])
-            && let Some(end) = after.find('*')
-        {
-            out.push_str(&format!("{ITALIC}{}{RESET}", &after[..end]));
-            rest = &after[end + 1..];
-        } else if let Some((alt, _, tail)) = rest.strip_prefix('!').and_then(link) {
-            let sep = if alt.is_empty() { "" } else { ": " };
-            out.push_str(&format!("{ITALIC}[image{sep}{alt}]{RESET}"));
-            rest = tail;
-        } else if let Some((text, target, tail)) = link(rest) {
-            // Drop a trailing "title"; in-page anchors go nowhere in a pager.
-            let url = target.split_whitespace().next().unwrap_or("");
-            out.push_str(&format!("{UNDERLINE}{}{RESET}", inline(text)));
-            if !url.is_empty() && !url.starts_with('#') && url != text {
-                out.push_str(&format!(" {DIM}({url}){RESET}"));
-            }
-            rest = tail;
+    while let Some(c) = rest.chars().next() {
+        let len = if c == '\x1b' {
+            escape_len(rest)
         } else {
-            let ch = rest.chars().next().unwrap();
-            out.push(ch);
-            rest = &rest[ch.len_utf8()..];
-        }
+            out.push(c);
+            c.len_utf8()
+        };
+        rest = &rest[len..];
     }
     out
 }
@@ -843,25 +1066,14 @@ fn inline(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// What's left when the styling is gone — what the reader sees.
-    fn plain(s: &str) -> String {
-        let mut out = String::new();
-        let mut rest = s;
-        while let Some(c) = rest.chars().next() {
-            let len = if c == '\x1b' {
-                escape_len(rest)
-            } else {
-                out.push(c);
-                c.len_utf8()
-            };
-            rest = &rest[len..];
-        }
-        out
+    /// A one-line document, rendered: what running text comes out as.
+    fn inline(md: &str) -> String {
+        render(md, 200).text.trim_end().to_string()
     }
 
     #[test]
     fn renders_blocks() {
-        let md = "# Title\n#### Deep ##\n* * *\n  - nested\n- [x] done\n- [ ] todo\n> quoted\n1. first\n";
+        let md = "# Title\n\n#### Deep ##\n\n* * *\n\n- top\n  - nested\n- [x] done\n- [ ] todo\n\n> quoted\n\n1. first\n";
         let out = render(md, 80).text;
         assert!(out.contains("\x1b[1m\x1b[4mTitle\x1b[0m"), "{out}");
         assert!(
@@ -869,10 +1081,48 @@ mod tests {
             "closing #s dropped: {out}"
         );
         assert!(out.contains(&"─".repeat(40)), "spaced rule is not a bullet");
-        assert!(out.contains("    • nested"), "indent kept: {out}");
-        assert!(out.contains("  ☑ done") && out.contains("  ☐ todo"));
+        assert!(
+            out.contains("  • top\n    • nested\n"),
+            "a nested list starts under its item's text: {out}"
+        );
+        assert!(out.contains("  ☑ done\n  ☐ todo\n"), "{out}");
         assert!(out.contains("│\x1b[0m quoted"));
-        assert!(out.contains("1. first"));
+        assert!(out.contains("  1. first"));
+    }
+
+    /// What the line-by-line renderer this replaced could not read.
+    #[test]
+    fn the_rest_of_commonmark_and_gfm() {
+        let md = "---\ntitle: x\n---\n\nSetext\n======\n\nsoft\nwrapped <https://a.b> and [ref] and note[^1].\n\n- item\n\n  its second paragraph\n\n      indented code\n\n> [!WARNING]\n> careful\n\nTerm\n: what it means\n\n[ref]: https://r.ef \"title\"\n[^1]: the footnote\n";
+        let out = render(md, 80);
+        let text = plain(&out.text);
+        assert!(
+            text.starts_with("╭─ yaml "),
+            "front matter is boxed: {text}"
+        );
+        assert!(out.text.contains("\x1b[1m\x1b[4mSetext\x1b[0m"), "{text}");
+        assert!(
+            text.contains("soft wrapped https://a.b and ref (https://r.ef) and note[1]."),
+            "one paragraph; the autolink isn't repeated; the reference resolves: {text}"
+        );
+        assert!(
+            text.contains("  • item\n\n    its second paragraph\n\n    ╭─"),
+            "an item holds paragraphs and code, under its text: {text}"
+        );
+        assert_eq!(out.code, ["title: x", "indented code"]);
+        assert!(text.contains("│ Warning\n│ careful\n"), "{text}");
+        assert!(text.contains("Term\n    what it means\n"), "{text}");
+        assert!(text.contains("[1] the footnote"), "{text}");
+    }
+
+    #[test]
+    fn a_file_cannot_drive_the_terminal() {
+        let out = render(
+            "text \x1b[2J `code \x1b]0;x\x07`\n\n```\n\x1b[31mred\n```\n",
+            40,
+        );
+        assert!(!plain(&out.text).contains('\x1b') && out.text.contains("␛[2J"));
+        assert_eq!(out.code, ["␛[31mred"]);
     }
 
     #[test]
@@ -891,7 +1141,7 @@ mod tests {
             ],
             "shorter fence stays inside; fence indent stripped; nothing parsed"
         );
-        assert_eq!(lines[5], "after bold", "fence closed");
+        assert_eq!(lines[5..], ["", "after bold"], "fence closed");
     }
 
     #[test]
@@ -1050,15 +1300,23 @@ mod tests {
         assert!(title.contains("\x1b[1m\x1b[4mOxide"), "h1 is a heading");
         assert_eq!(plain(title), format!("{}Oxide", " ".repeat(17)), "centered");
         assert!(
-            text.contains("  A & B\n"),
-            "entity decoded, br breaks: {text}"
+            text.contains("\nA & B\nit b k site (https://x)\n"),
+            "entity decoded, br breaks, the HTML's indentation dropped: {text}"
         );
         assert!(out.contains("\x1b[3mit\x1b[0m \x1b[1mb\x1b[0m \x1b[36mk\x1b[0m"));
-        assert!(text.contains("site (https://x)"));
         assert!(text.contains("Vec<String> and <p> stay"), "{text}");
         assert!(
             !text.contains("\n\n\n"),
             "tag-only lines don't stack blanks"
+        );
+    }
+
+    #[test]
+    fn html_in_running_text_is_styled() {
+        let out = inline("a <b>bold <kbd>k</kbd> still</b> <del>gone</del><!-- x --> b<br>c </i>");
+        assert_eq!(
+            out,
+            "a \x1b[1mbold \x1b[36mk\x1b[0m\x1b[1m still\x1b[0m \x1b[9mgone\x1b[0m b\nc"
         );
     }
 
@@ -1078,6 +1336,61 @@ mod tests {
             "a badge: image inside a link"
         );
         assert_eq!(inline("a [b] c"), "a [b] c");
+    }
+
+    #[test]
+    fn styles_nest_and_survive_what_they_enclose() {
+        // The checked-off line from a task list: struck through, code and all.
+        assert_eq!(
+            inline("~~`Drawer`: resize~~ ok"),
+            "\x1b[9m\x1b[36mDrawer\x1b[0m\x1b[9m: resize\x1b[0m ok"
+        );
+        assert_eq!(
+            inline("**a *b* c**"),
+            "\x1b[1ma \x1b[3mb\x1b[0m\x1b[1m c\x1b[0m"
+        );
+        assert_eq!(
+            inline("_it_ and __bold__"),
+            "\x1b[3mit\x1b[0m and \x1b[1mbold\x1b[0m"
+        );
+        for literal in ["snake_case_name", "a ~~ b ~~ c", "~~unclosed", r"\*not\*"] {
+            assert_eq!(
+                plain(&inline(literal)),
+                literal.replace('\\', ""),
+                "{literal}"
+            );
+            assert!(!inline(literal).contains('\x1b'), "{literal}");
+        }
+        let heading = render("## Set `this` up\n", 80).text;
+        assert!(
+            heading.contains("\x1b[36mthis\x1b[0m\x1b[1m\x1b[36m up"),
+            "the heading's style resumes after the code: {heading:?}"
+        );
+    }
+
+    #[test]
+    fn long_lines_wrap_under_their_own_text() {
+        let md = "- [x] ~~one two three four~~ five\n\n> quoted words go here\n\n10. numbered item wraps too\n\nplain words wrap\n";
+        let out = render(md, 20).text;
+        assert_eq!(
+            plain(&out).lines().collect::<Vec<_>>(),
+            [
+                "  ☑ one two three",
+                "    four five",
+                "",
+                "│ quoted words go",
+                "│ here",
+                "",
+                "  10. numbered item",
+                "      wraps too",
+                "",
+                "plain words wrap",
+            ]
+        );
+        assert!(
+            out.contains("\x1b[9mfour\x1b[0m five"),
+            "a style carries over the break: {out:?}"
+        );
     }
 
     #[test]

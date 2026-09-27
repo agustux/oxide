@@ -188,7 +188,7 @@ ligatures   = false
 
 [window]
 padding  = { x = 12, y = 8 }
-opacity  = 1.0                # 0.0 - 1.0; < 1.0 makes the background translucent
+opacity  = 1.0                # 0.0 - 1.0; < 1.0 makes the whole window's background translucent
 blur     = false              # blur what's behind a translucent window
 titlebar = "hidden"           # native | hidden
 new_tab_directory = "pwd"     # pwd | home — where cmd-t starts
@@ -222,8 +222,13 @@ follow_cwd        = true      # re-root the tree when the shell cd's
 git_status        = true      # colour rows by git state (modified, added, untracked…)
 open_on_startup   = true      # false starts with the drawer hidden (cmd-b shows it)
 
-# [editor]
+[editor]
+open_in = "tab"               # tab | split — where a file opens when the focused pane is
+                              # busy (a terminal editor still showing the last file)
 # open_at_line = "myeditor --line {line} {path}"   # for editors Oxide doesn't know
+
+[markdown]
+preview_in = "tab"            # tab | split — where a markdown preview opens
 
 # bell = "none"               # none | sound | visual
 # copy_on_select = false      # mouse selection copies to clipboard on release

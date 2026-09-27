@@ -26,6 +26,14 @@ pub fn blend(color: Hsla, toward: Hsla, amount: f32) -> Hsla {
     .into()
 }
 
+/// A background at `window.opacity`. Every region of the window paints
+/// exactly one of these and nothing beneath it, so the whole window is as
+/// see-through as the setting says: layers would multiply.
+pub fn translucent(mut color: Hsla, opacity: f32) -> Hsla {
+    color.a *= opacity.clamp(0.1, 1.0);
+    color
+}
+
 /// Resolve an ANSI color against the theme. Pure; unit-tested below.
 pub fn resolve(color: Color, theme: &Theme) -> Hsla {
     match color {

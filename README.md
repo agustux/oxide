@@ -101,14 +101,18 @@ The short tour. Every feature has a page in the [docs](https://oxideterminal.com
 - **File tree drawer** — follows the focused pane, so switching splits re-roots it to
   that shell's directory. Modeless vim navigation (`j`/`k`/`gg`/`G`, nvim-tree style `h`/`l`),
   type-to-filter with `/`, and file operations: `a` add, `r` rename, `m` move, `d` delete
-  (to Trash).
+  (to Trash) — or drag a row onto a directory to move it there. Drag the drawer's edge to
+  resize it.
   Dims gitignored files, watches the filesystem, and follows the shell's `cd` automatically.
 - **The tree/terminal seam** — `y` inserts the selected path at the prompt, quoted and
   relative; `cmd-click` a `path:line:col` in output to open it in `$EDITOR` at that line
   (nvim, VS Code, emacs, Sublime, Helix dialects built in); rows are coloured by git status;
   `cmd-p` fuzzy-finds any file under the root; `cmd-shift-r` reveals the shell's directory;
   right-click a row to re-root, copy, or reveal in Finder / your file manager — or, on a `.md` file, preview it
-  rendered in a new tab (tables, highlighted code with click-to-copy); drag rows or drop files onto a pane.
+  rendered in a new tab or split (`markdown.preview_in`; full CommonMark and GitHub markdown, with
+  tables and highlighted code with click-to-copy);
+  drag rows or drop files onto a pane. A file opened while the pane is busy in an editor gets a tab
+  or split of its own (`editor.open_in`).
 - **Scrollback search** — `cmd-f`, live, `⏎`/`⇧⏎` to walk matches; regex, case-sensitive,
   and whole-word toggles as clickable chips (`cmd-alt-r` / `c` / `w`), and a malformed
   regex says so instead of matching nothing.
@@ -150,6 +154,8 @@ The short tour. Every feature has a page in the [docs](https://oxideterminal.com
   border and a loud status-bar pill), `ctrl-w o` closes the others, `ctrl-w x` swaps with
   the neighbour. `window.inactive_pane_opacity` dims the panes you aren't in.
 - **Command palette** — `cmd-shift-p` lists every action with its binding, fuzzy-searchable.
+  Every text field edits like the rest of the system: `opt-←/→` by word, `opt-delete` a word
+  back, `cmd-←/→` to the ends (`ctrl` on Linux).
 - **Menus on Linux** — a ☰ button in the top-left corner holds the same Oxide / File /
   Edit / View / Window / Help menus macOS puts in the menu bar, shortcuts included
   (`app::menu` opens it from the keyboard).
@@ -166,8 +172,8 @@ The short tour. Every feature has a page in the [docs](https://oxideterminal.com
   (`tabs.show_numbers`), and the whole bar can be hidden — View → Toggle Tab Bar, or
   `tabs.enabled = false` — with the status bar still showing which tab you're on.
 - **Workspaces** — named sets of tabs and splits, tmux-session style, managed from the
-  drawer below the file tree (`a` add, `r` rename, `d` delete, `p` pin); `cmd-alt-1..9`
-  jump straight to one. Temporary by
+  drawer below the file tree (`a` add, `r` rename, `d` delete, `p` pin, drag to reorder);
+  `cmd-alt-1..9` jump straight to one. Temporary by
   default; pinned ones survive restarts, restoring layout, tabs, splits, and each
   pane's directory with fresh shells.
 - **Startup commands** — the tmuxinator move: give a pane a command (`ctrl-w r`,
@@ -240,6 +246,7 @@ The `ctrl-w` chords are the same everywhere. Where macOS uses `cmd`, Linux uses
 | `c` / `-` | re-root at selection / at parent (cd's the shell too) |
 | `/` | filter (`esc` clears) |
 | `a` / `r` / `m` / `d` | add (`dir/` with trailing slash) / rename / move / delete to Trash |
+| drag a row | onto a directory: move it there; onto a pane: insert its path |
 | `I` / `R` | toggle hidden / refresh |
 | `esc` | dismiss input → clear filter → back to terminal |
 
@@ -269,6 +276,7 @@ The `ctrl-w` chords are the same everywhere. Where macOS uses `cmd`, Linux uses
 | `j` / `k` | move selection |
 | `enter` / `o` | switch to workspace |
 | `a` / `r` / `d` | add / rename / delete (`y` confirms) — also on right-click |
+| drag a row | reorder |
 | `p` | pin — persist this workspace across restarts |
 | `e` | edit every pane's startup command — also on right-click |
 | `esc` | dismiss input → back to terminal |
@@ -305,6 +313,12 @@ accent = "#f38ba8"
 [tree]
 follow_cwd = true             # tree re-roots when the shell cd's
 open_on_startup = true        # false starts with the drawer hidden (cmd-b shows it)
+
+[editor]
+open_in = "tab"               # tab | split — where a file opens when the pane is busy
+
+[markdown]
+preview_in = "tab"            # tab | split — where a markdown preview opens
 
 [status_bar]
 enabled  = true
