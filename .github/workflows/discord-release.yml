@@ -1,0 +1,27 @@
+name: Announce release on Discord
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  announce:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          NAME: ${{ github.event.release.name }}
+          TAG: ${{ github.event.release.tag_name }}
+          URL: ${{ github.event.release.html_url }}
+          BODY: ${{ github.event.release.body }}
+        run: |
+          jq -n \
+            --arg title "🚀 ${NAME:-$TAG} is out" \
+            --arg url "$URL" \
+            --arg desc "$(printf '%s' "$BODY" | head -c 3500)
+
+          **Update:** Oxide → Check for Updates… · \`brew upgrade --cask oxide-terminal\`" \
+            '{embeds: [{title: $title, url: $url, description: $desc, color: 16753920}]}' \
+          | curl -sS --fail-with-body -H "Content-Type: application/json" -d @- "$WEBHOOK"
