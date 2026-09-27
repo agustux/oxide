@@ -22,7 +22,7 @@ jobs:
             --arg title "🐛 #$NUMBER $TITLE" \
             --arg url "$URL" \
             --arg author "$AUTHOR" \
-            --arg desc "$(printf '%s' "$BODY" | head -c 300)" \
+            --arg desc "$(printf '%s' "$BODY" | awk '/^### What happened\?/{f=1;next} /^### /{f=0} f' | head -c 300)" \
             '{embeds: [{title: $title, url: $url, description: $desc,
                         color: 15158332, author: {name: $author}}]}' \
           | curl -sSf -H "Content-Type: application/json" -d @- "$WEBHOOK"
