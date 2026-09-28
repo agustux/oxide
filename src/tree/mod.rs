@@ -1023,8 +1023,7 @@ impl FileTree {
         self.scan_dir(parent, cx);
     }
 
-    /// The footer line: a label, the text either side of the caret when
-    /// something is being typed, and a hint.
+    /// See [`FooterText`].
     fn footer_text(&self) -> Option<FooterText> {
         let edit = |label: &str, b: &LineEdit, hint: &str| {
             let (before, after) = b.split();
