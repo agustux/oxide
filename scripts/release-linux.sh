@@ -64,11 +64,16 @@ if [[ -z "${NO_UPLOAD:-}" ]]; then
     echo "error: $DOWNLOADS/releases/$VERSION.json isn't there — release.sh didn't finish?" >&2
     exit 1
   }
-  if curl -fsI "$DOWNLOADS/$PREFIX/$(basename "$TARBALL")" >/dev/null 2>&1; then
-    echo "error: $DOWNLOADS/$PREFIX/ already has the $ARCH tarball; published files are never overwritten" >&2
-    exit 1
-  fi
 fi
+
+# Size of an object as served through the custom domain, or empty if it isn't
+# there. The query string keeps this off Cloudflare's cache: a plain request
+# for a missing object caches the 404 for minutes, which would then hide the
+# upload from the check below.
+remote_size() {
+  curl -sI --max-time 20 "$DOWNLOADS/$1?check=$RANDOM$RANDOM" | tr -d '\r' | tr '[:upper:]' '[:lower:]' \
+    | awk '/^http\// { ok = ($2 == "200") } /^content-length:/ { len = $2 } END { if (ok) print len }'
+}
 
 scripts/linux-package.sh
 SHA=$(sha256sum "$TARBALL" | cut -d' ' -f1)
@@ -77,6 +82,7 @@ if [[ -z "${NO_UPLOAD:-}" ]]; then
   # Same shape as the DMG's signature: the trusted comment names the version
   # and platform, so a signature only ever vouches for the file it was made for.
   echo "==> signing the tarball"
+  rm -f "$TARBALL.minisig"
   minisign -S -s "$UPDATE_KEY" -m "$TARBALL" -x "$TARBALL.minisig" \
     -t "oxide $VERSION linux-$ARCH" -c "Oxide $VERSION linux-$ARCH"
   minisign -V -p update.pub -m "$TARBALL" -x "$TARBALL.minisig" -q
@@ -88,10 +94,23 @@ if [[ -z "${NO_UPLOAD:-}" ]]; then
   NAME=$(basename "$TARBALL")
 
   echo "==> uploading to $DOWNLOADS/$PREFIX/"
-  put "$TARBALL" "$PREFIX/$NAME" application/gzip "$IMMUTABLE"
+  # Published once: already up with the same size is a rerun, skip it; a
+  # different size means a reused version number, stop.
+  HAVE=$(remote_size "$PREFIX/$NAME")
+  if [[ -n "$HAVE" && "$HAVE" == "$(stat -c %s "$TARBALL")" ]]; then
+    echo "    $PREFIX/$NAME already published, skipping"
+  elif [[ -n "$HAVE" ]]; then
+    echo "error: $DOWNLOADS/$PREFIX/$NAME exists with different contents; published files are never overwritten" >&2
+    exit 1
+  else
+    put "$TARBALL" "$PREFIX/$NAME" application/gzip "$IMMUTABLE"
+  fi
   put "$TARBALL.minisig" "$PREFIX/$NAME.minisig" text/plain "$IMMUTABLE"
-  curl -fsSI --retry 5 --retry-delay 3 --retry-all-errors "$DOWNLOADS/$PREFIX/$NAME" >/dev/null \
-    || { echo "error: $DOWNLOADS/$PREFIX/$NAME isn't serving; not touching the manifest" >&2; exit 1; }
+  for attempt in 1 2 3 4 5 6; do
+    [[ "$(remote_size "$PREFIX/$NAME")" == "$(stat -c %s "$TARBALL")" ]] && break
+    [[ $attempt == 6 ]] && { echo "error: $DOWNLOADS/$PREFIX/$NAME isn't serving the uploaded bytes; not touching the manifest" >&2; exit 1; }
+    sleep 5
+  done
 
   echo "==> mirroring on GitHub"
   gh release upload "$TAG" "$TARBALL" --clobber

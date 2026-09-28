@@ -62,7 +62,12 @@ This runs `dmg.sh` (sign, notarize, staple), then:
 It refuses to run if the changelog section is missing or empty, so a
 forgotten changelog rename fails before the slow build starts, and likewise
 if `update.pub` is still the placeholder, minisign or the key is missing,
-wrangler isn't logged in, or the bucket already has this version. The DMG
+wrangler isn't logged in, or the bucket already has this version.
+
+If it fails partway (an upload, GitHub, the cask), fix the cause and rerun
+with `SKIP_BUILD=1 ./scripts/release.sh`: it reuses the DMG in `target/`,
+skips objects that are already in the bucket with the same size, and leaves
+an existing GitHub release alone, so it picks up where it stopped. The DMG
 goes up under two names:
 
 - `Oxide-<version>.dmg` — what the website's download button and the cask serve
