@@ -77,32 +77,59 @@ fn system_beep() -> bool {
     }
 }
 
-/// Plays the desktop's bell sound through `canberra-gtk-play`, falling back to
-/// `paplay` if unavailable. Runs asynchronously so audio playback never blocks the terminal.
+/// Linux has no single beep API: uses `canberra-gtk-play` (libcanberra),
+/// falling back to `paplay` + freedesktop-sound-theme. Returns `false` if
+/// unavailable; playback is backgrounded and serialized to drop BEL floods.
 #[cfg(not(target_os = "macos"))]
 fn linux_beep() -> bool {
+    use std::path::Path;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    std::thread::Builder::new()
+    const FALLBACK: &str = "/usr/share/sounds/freedesktop/stereo/bell.oga";
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+    let canberra = on_path("canberra-gtk-play");
+    let paplay = on_path("paplay") && Path::new(FALLBACK).is_file();
+    if !canberra && !paplay {
+        return false;
+    }
+    if IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return true; // one is already playing; don't pile up
+    }
+
+    let spawned = std::thread::Builder::new()
         .name("oxide-bell".into())
-        .spawn(|| {
-            let canberra = Command::new("canberra-gtk-play")
-                .args(["-i", "bell"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            if !matches!(canberra, Ok(status) if status.success()) {
-                let _ = Command::new("paplay")
-                    .arg("/usr/share/sounds/freedesktop/stereo/bell.oga")
-                    .stdin(Stdio::null())
+        .spawn(move || {
+            let run = |cmd: &mut Command| {
+                cmd.stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .status();
+                    .status()
+            };
+            let played = canberra
+                && matches!(
+                    run(Command::new("canberra-gtk-play").args(["-i", "bell"])),
+                    Ok(s) if s.success()
+                );
+            if !played && paplay {
+                let _ = run(Command::new("paplay").arg(FALLBACK));
             }
-        })
-        .ok();
+            IN_FLIGHT.store(false, Ordering::Release);
+        });
+    if spawned.is_err() {
+        IN_FLIGHT.store(false, Ordering::Release);
+        return false;
+    }
     true
+}
+
+/// Is `bin` a file in some `$PATH` directory?
+#[cfg(not(target_os = "macos"))]
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+        .unwrap_or(false)
 }
 
 pub enum TerminalEvent {
