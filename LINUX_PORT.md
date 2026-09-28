@@ -19,7 +19,7 @@ Nothing else in the crate knows which OS it's on.
 
 | area | macOS | Linux | where |
 |---|---|---|---|
-| bell | `NSBeep` | `canberra-gtk-play` (XDG theme), falling back to `paplay` | `terminal/mod.rs` `system_beep` |
+| bell | `NSBeep` | `canberra-gtk-play` (XDG theme), falling back to `paplay`,then the visual flash | `terminal/mod.rs` `system_beep` |
 | foreground cwd | `proc_pidinfo(PROC_PIDVNODEPATHINFO)` | `/proc/<pgrp>/cwd` | `terminal/session.rs` |
 | foreground name / argv | `proc_pidinfo` + `KERN_PROCARGS2` | `/proc/<pid>/comm` (+ `exe` for the untruncated name), `/proc/<pid>/cmdline` | `terminal/process.rs` |
 | notifications | `UNUserNotificationCenter` (bundle) / `osascript` | `notify-send -A default=Open -w`; a click prints the action and routes back to the pane | `notifications.rs`, `Cargo.toml` (`objc`/`block` are macOS-only deps) |
