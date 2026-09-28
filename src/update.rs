@@ -1,22 +1,40 @@
-//! Self-update from GitHub releases.
+//! Self-update.
 //!
-//! Blocking helpers — call on the background pool. On macOS the install step
-//! swaps the bundle from a detached shell after the app quits, then
-//! relaunches. On Linux there is no in-place install (packages come from the
-//! AUR or a tarball), so a newer release is only announced: the pill opens
-//! the release page.
+//! Blocking helpers — call on the background pool.
+//!
+//! The latest version comes from a manifest on downloads.oxideterminal.com
+//! (see RELEASING.md) with one entry per platform build.
+//!
+//! macOS: the entry points at a DMG in the same bucket. The DMG must carry a
+//! minisign signature that verifies against the public key compiled in
+//! (`update.pub`) before it is kept; the install step then swaps the bundle
+//! from a detached shell after the app quits, and relaunches.
+//!
+//! Linux: there is no in-place install (packages come from the AUR or a
+//! tarball), so a release is only announced, and only once the manifest has a
+//! `linux-<arch>` entry: the pill opens the release page.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-const RELEASES_API: &str = "https://api.github.com/repos/oxide-terminal/oxide/releases/latest";
+/// Where the updater looks for the latest release. `scripts/release.sh`
+/// publishes it after the DMG it points at; `release-linux.sh` adds the
+/// Linux entry after the tarball is up.
+const MANIFEST_URL: &str = "https://downloads.oxideterminal.com/releases/stable.json";
+
+/// The minisign public key updates must be signed with (`minisign -G`). While
+/// the file holds the placeholder text, macOS updates are refused.
+#[cfg(any(target_os = "macos", test))]
+const UPDATE_PUBLIC_KEY: &str = include_str!("../update.pub");
 
 pub struct ReleaseInfo {
     pub version: String,
     /// macOS: the DMG to download. Linux: the release page to open.
     pub url: String,
+    /// macOS: the contents of the DMG's `.minisig` file. Linux: None.
+    pub signature: Option<String>,
 }
 
 fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
@@ -38,78 +56,126 @@ pub fn is_newer(remote: &str, local: &str) -> bool {
     }
 }
 
-/// Query the latest release. Returns None when there's no asset for this
-/// platform yet (a DMG on macOS, a Linux tarball on Linux).
+/// Query the latest release. Returns None when the manifest has no entry for
+/// this platform yet: on Linux the tarball is built on a separate machine
+/// after the macOS release, so a release only counts once it's up.
 pub fn fetch_latest() -> Result<Option<ReleaseInfo>, String> {
     let out = Command::new("curl")
         .args([
             "-sSL",
             "--max-time",
             "20",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "User-Agent: oxide-terminal",
-            RELEASES_API,
+            "-w",
+            "\n%{http_code}",
+            "-A",
+            concat!("oxide-terminal/", env!("CARGO_PKG_VERSION")),
+            MANIFEST_URL,
         ])
         .output()
         .map_err(|e| format!("update check failed: {e}"))?;
     if !out.status.success() {
         return Err("update check failed: network unreachable".into());
     }
+    let (status, body) = split_status(&out.stdout).ok_or("update check failed: bad response")?;
+    match status {
+        200 => {}
+        // No manifest published yet — not an error.
+        404 => return Ok(None),
+        s => return Err(format!("update check failed: server said {s}")),
+    }
     let json: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("update check failed: {e}"))?;
-    // A 404 body ({"message": "Not Found"}) means no releases yet — not an error.
-    let Some(tag) = json["tag_name"].as_str() else {
-        return Ok(None);
-    };
-    let Some(url) = release_url(&json) else {
-        return Ok(None);
-    };
-    Ok(Some(ReleaseInfo {
-        version: tag.trim_start_matches('v').to_string(),
-        url: url.to_string(),
-    }))
+        serde_json::from_slice(body).map_err(|e| format!("update check failed: {e}"))?;
+    Ok(parse_manifest(&json, std::env::consts::OS, std::env::consts::ARCH))
 }
 
-#[cfg(target_os = "macos")]
-fn release_url(release: &serde_json::Value) -> Option<&str> {
-    dmg_url(release)
+/// Split curl's `-w '\n%{http_code}'` trailer off the body.
+fn split_status(out: &[u8]) -> Option<(u16, &[u8])> {
+    let cut = out.iter().rposition(|&b| b == b'\n')?;
+    let status = std::str::from_utf8(&out[cut + 1..]).ok()?.trim().parse().ok()?;
+    Some((status, &out[..cut]))
 }
 
-/// The Linux build is attached after the macOS release (it's built on a
-/// separate machine), so a release only counts once its tarball is up:
-/// otherwise the pill would point at a page with nothing to install.
-#[cfg(not(target_os = "macos"))]
-fn release_url(release: &serde_json::Value) -> Option<&str> {
-    linux_tarball_present(release, std::env::consts::ARCH)
-        .then(|| release["html_url"].as_str())
-        .flatten()
+/// The release described by the manifest, for this platform (`os` and `arch`
+/// as Rust's `std::env::consts` spell them; the manifest keys match). None
+/// when the manifest has no build for it, or is malformed: nothing to offer
+/// either way. Only https URLs are accepted; on macOS the signature check is
+/// what actually vouches for the file, but there's no reason to fetch it over
+/// plain http.
+fn parse_manifest(manifest: &serde_json::Value, os: &str, arch: &str) -> Option<ReleaseInfo> {
+    let version = manifest["version"].as_str()?.trim_start_matches('v');
+    parse_version(version)?;
+    fn https(v: &serde_json::Value) -> Option<&str> {
+        v.as_str().filter(|u| u.starts_with("https://"))
+    }
+    let asset = &manifest["assets"][format!("{os}-{arch}")];
+    if os == "macos" {
+        let url = https(&asset["url"])?;
+        let signature = asset["signature"].as_str()?;
+        Some(ReleaseInfo {
+            version: version.to_string(),
+            url: url.to_string(),
+            signature: Some(signature.to_string()),
+        })
+    } else {
+        // Announce only: the entry's presence says the build exists; the pill
+        // opens the release page rather than the tarball.
+        https(&asset["url"])?;
+        let page = https(&manifest["release_url"])?;
+        Some(ReleaseInfo {
+            version: version.to_string(),
+            url: page.to_string(),
+            signature: None,
+        })
+    }
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
-fn linux_tarball_present(release: &serde_json::Value, arch: &str) -> bool {
-    let suffix = format!("-linux-{arch}.tar.gz");
-    release["assets"].as_array().is_some_and(|assets| {
-        assets
-            .iter()
-            .any(|a| a["name"].as_str().is_some_and(|n| n.ends_with(&suffix)))
-    })
-}
-
-/// Releases carry the same DMG twice: `Oxide-x.y.z-update.dmg` for the
-/// updater and `Oxide-x.y.z.dmg` for the website, so GitHub's per-asset
-/// download counts keep installs and updates apart. Older releases only have
-/// the plain one.
+/// What `release.sh` writes as the signature's trusted comment. It's covered
+/// by the signature, so a validly signed DMG can't be passed off as another
+/// version or architecture.
 #[cfg(any(target_os = "macos", test))]
-fn dmg_url(release: &serde_json::Value) -> Option<&str> {
-    let assets = release["assets"].as_array()?;
-    let named = |suffix: &str| {
-        assets
-            .iter()
-            .find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(suffix)))
-    };
-    named("-update.dmg").or_else(|| named(".dmg"))?["browser_download_url"].as_str()
+fn signed_comment(version: &str, arch: &str) -> String {
+    format!("oxide {version} macos-{arch}")
+}
+
+/// Check `path` against a minisign `signature` made with `public_key`, and
+/// that the signature was issued for exactly `expected_comment`.
+#[cfg(any(target_os = "macos", test))]
+fn verify_signature(
+    path: &Path,
+    public_key: &str,
+    signature: &str,
+    expected_comment: &str,
+) -> Result<(), String> {
+    use minisign_verify::{PublicKey, Signature};
+    use std::io::Read;
+
+    let key = PublicKey::decode(public_key)
+        .map_err(|_| "updates are disabled: this build has no update signing key".to_string())?;
+    let sig = Signature::decode(signature)
+        .map_err(|_| "update rejected: unreadable signature".to_string())?;
+    let mut verifier = key
+        .verify_stream(&sig)
+        .map_err(|_| "update rejected: signed by a different key".to_string())?;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("update verification failed: {e}"))?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("update verification failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        verifier.update(&buf[..n]);
+    }
+    verifier
+        .finalize()
+        .map_err(|_| "update rejected: signature doesn't match the download".to_string())?;
+    // Checked after the signature, so the comment is known to be authentic.
+    if sig.trusted_comment() != expected_comment {
+        return Err("update rejected: signed for a different version".into());
+    }
+    Ok(())
 }
 
 /// The version that ran last time, when this binary is newer than it — i.e.
@@ -145,13 +211,26 @@ fn updates_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Download the DMG and keep it only if its signature verifies. A copy
+/// already in the cache is checked the same way (it may predate signing, or
+/// have been damaged) and fetched again if it fails.
 #[cfg(target_os = "macos")]
 pub fn download(info: &ReleaseInfo) -> Result<PathBuf, String> {
+    let signature = info
+        .signature
+        .as_deref()
+        .ok_or("update rejected: no signature")?;
+    let comment = signed_comment(&info.version, std::env::consts::ARCH);
+    let verify = |path: &Path| verify_signature(path, UPDATE_PUBLIC_KEY, signature, &comment);
+
     let dir = updates_dir().ok_or("no cache directory")?;
     let dest = dir.join(format!("Oxide-{}.dmg", info.version));
     let partial = dir.join(format!("Oxide-{}.dmg.partial", info.version));
     if dest.exists() {
-        return Ok(dest);
+        if verify(&dest).is_ok() {
+            return Ok(dest);
+        }
+        let _ = std::fs::remove_file(&dest);
     }
     let status = Command::new("curl")
         .args(["-fsSL", "--max-time", "600", "-o"])
@@ -162,6 +241,10 @@ pub fn download(info: &ReleaseInfo) -> Result<PathBuf, String> {
     if !status.success() {
         let _ = std::fs::remove_file(&partial);
         return Err("update download failed".into());
+    }
+    if let Err(e) = verify(&partial) {
+        let _ = std::fs::remove_file(&partial);
+        return Err(e);
     }
     std::fs::rename(&partial, &dest).map_err(|e| format!("download failed: {e}"))?;
     Ok(dest)
@@ -251,28 +334,123 @@ mod tests {
     }
 
     #[test]
-    fn prefers_update_dmg_and_falls_back() {
-        let both = serde_json::json!({"assets": [
-            {"name": "Oxide-1.0.0.dmg", "browser_download_url": "site"},
-            {"name": "Oxide-1.0.0-update.dmg", "browser_download_url": "update"},
-        ]});
-        assert_eq!(dmg_url(&both), Some("update"));
-        let old = serde_json::json!({"assets": [{"name": "Oxide-0.5.0.dmg", "browser_download_url": "site"}]});
-        assert_eq!(dmg_url(&old), Some("site"));
-        assert_eq!(dmg_url(&serde_json::json!({"assets": []})), None);
+    fn manifest_picks_this_platform() {
+        let m = serde_json::json!({
+            "version": "1.2.3",
+            "release_url": "https://example.com/releases/v1.2.3",
+            "assets": {
+                "macos-aarch64": {"url": "https://example.com/arm.dmg", "signature": "sig-arm"},
+                "macos-x86_64": {"url": "https://example.com/x86.dmg", "signature": "sig-x86"},
+                "linux-x86_64": {"url": "https://example.com/linux.tar.gz"},
+            }
+        });
+        let info = parse_manifest(&m, "macos", "aarch64").unwrap();
+        assert_eq!(info.version, "1.2.3");
+        assert_eq!(info.url, "https://example.com/arm.dmg");
+        assert_eq!(info.signature.as_deref(), Some("sig-arm"));
+        let info = parse_manifest(&m, "macos", "x86_64").unwrap();
+        assert_eq!(info.url, "https://example.com/x86.dmg");
+        assert!(parse_manifest(&m, "macos", "riscv64").is_none(), "no build for this arch");
+
+        // Linux announces the release page, and only once its tarball is up.
+        let info = parse_manifest(&m, "linux", "x86_64").unwrap();
+        assert_eq!(info.url, "https://example.com/releases/v1.2.3");
+        assert!(info.signature.is_none());
+        assert!(parse_manifest(&m, "linux", "aarch64").is_none(), "other arch");
     }
 
     #[test]
-    fn linux_release_needs_its_tarball() {
-        let with = serde_json::json!({"assets": [
-            {"name": "Oxide-1.0.0.dmg"},
-            {"name": "oxide-1.0.0-linux-x86_64.tar.gz"},
-        ]});
-        assert!(linux_tarball_present(&with, "x86_64"));
-        assert!(!linux_tarball_present(&with, "aarch64"), "other arch");
-        let mac_only = serde_json::json!({"assets": [{"name": "Oxide-1.0.0.dmg"}]});
-        assert!(!linux_tarball_present(&mac_only, "x86_64"));
-        assert!(!linux_tarball_present(&serde_json::json!({}), "x86_64"));
+    fn linux_release_needs_its_tarball_and_a_page() {
+        let mac_only = serde_json::json!({
+            "version": "1.0.0",
+            "release_url": "https://e.com/r",
+            "assets": {"macos-aarch64": {"url": "https://e.com/a.dmg", "signature": "s"}}
+        });
+        assert!(parse_manifest(&mac_only, "linux", "x86_64").is_none());
+        let no_page = serde_json::json!({
+            "version": "1.0.0",
+            "assets": {"linux-x86_64": {"url": "https://e.com/a.tar.gz"}}
+        });
+        assert!(parse_manifest(&no_page, "linux", "x86_64").is_none());
+    }
+
+    #[test]
+    fn manifest_rejects_malformed_entries() {
+        let good = |v: &str, url: &str, sig: serde_json::Value| {
+            serde_json::json!({
+                "version": v,
+                "assets": {"macos-aarch64": {"url": url, "signature": sig}}
+            })
+        };
+        let ok = good("v1.0.0", "https://e.com/a.dmg", "s".into());
+        assert_eq!(parse_manifest(&ok, "macos", "aarch64").unwrap().version, "1.0.0", "v prefix");
+        assert!(parse_manifest(&good("nope", "https://e.com/a.dmg", "s".into()), "macos", "aarch64").is_none());
+        assert!(parse_manifest(&good("1.0.0", "http://e.com/a.dmg", "s".into()), "macos", "aarch64").is_none());
+        assert!(parse_manifest(&good("1.0.0", "https://e.com/a.dmg", serde_json::Value::Null), "macos", "aarch64").is_none());
+        assert!(parse_manifest(&serde_json::json!({}), "macos", "aarch64").is_none());
+    }
+
+    #[test]
+    fn splits_curl_status_trailer() {
+        assert_eq!(split_status(b"{\"a\":1}\n200"), Some((200, &b"{\"a\":1}"[..])));
+        assert_eq!(split_status(b"multi\nline\nbody\n404"), Some((404, &b"multi\nline\nbody"[..])));
+        assert_eq!(split_status(b"\n503"), Some((503, &b""[..])));
+        assert_eq!(split_status(b"no trailer"), None);
+        assert_eq!(split_status(b"body\nnot-a-number"), None);
+    }
+
+    // Fixtures made with `rsign generate` / `rsign sign` (minisign-compatible)
+    // on a throwaway key that signs nothing real. The payload's trusted
+    // comment is "oxide 1.2.3 macos-aarch64".
+    const TEST_KEY: &str = "untrusted comment: minisign public key: 58F4D1FCED407935\nRWQ1eUDt/NH0WMVSbK5NalyE3K7bFDDpbwXoAU02CC3GEq15Hv4tCW92\n";
+    const OTHER_KEY: &str = "untrusted comment: minisign public key: 7217595898669E5F\nRWRfnmaYWFkXcmJ8XGPgA2+3eIhaLK4dvQMaVK6qNJlRkosec2ccVm8w\n";
+    const TEST_PAYLOAD: &[u8] = b"oxide test payload\n";
+    const TEST_SIG: &str = "untrusted comment: test\nRUQ1eUDt/NH0WGBfgeatoZmq9zHuJiWb3aL3RGqipUrZG4gCUEYmLhM+RY6EtzS62uzsRDpfWaegKfGD2ObBNl28ovrRLAGtwgQ=\ntrusted comment: oxide 1.2.3 macos-aarch64\n+Ct1Q/3ocZe+3M7xsfp+VBDr56XbW2086TyDmxM342A5SrhQ081meZyGxw5772jpzGnpAvQxHTao4LPuktnNCw==\n";
+
+    fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("oxide-update-test-{}-{name}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn signature_accepts_the_signed_file_only() {
+        let comment = signed_comment("1.2.3", "aarch64");
+        let good = temp_file("good", TEST_PAYLOAD);
+        assert_eq!(verify_signature(&good, TEST_KEY, TEST_SIG, &comment), Ok(()));
+
+        let tampered = temp_file("tampered", b"oxide test payload!\n");
+        let err = verify_signature(&tampered, TEST_KEY, TEST_SIG, &comment).unwrap_err();
+        assert!(err.contains("doesn't match"), "{err}");
+
+        let _ = std::fs::remove_file(good);
+        let _ = std::fs::remove_file(tampered);
+    }
+
+    #[test]
+    fn signature_is_bound_to_key_version_and_arch() {
+        let file = temp_file("bound", TEST_PAYLOAD);
+        let err = verify_signature(&file, OTHER_KEY, TEST_SIG, "oxide 1.2.3 macos-aarch64").unwrap_err();
+        assert!(err.contains("different key"), "{err}");
+        // A genuine signature can't be replayed as another version or arch.
+        for wrong in ["oxide 1.2.4 macos-aarch64", "oxide 1.2.3 macos-x86_64", ""] {
+            let err = verify_signature(&file, TEST_KEY, TEST_SIG, wrong).unwrap_err();
+            assert!(err.contains("different version"), "{wrong}: {err}");
+        }
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn signature_refuses_bad_inputs() {
+        let file = temp_file("bad-inputs", TEST_PAYLOAD);
+        let comment = signed_comment("1.2.3", "aarch64");
+        let err = verify_signature(&file, "PLACEHOLDER", TEST_SIG, &comment).unwrap_err();
+        assert!(err.contains("no update signing key"), "{err}");
+        let err = verify_signature(&file, TEST_KEY, "garbage", &comment).unwrap_err();
+        assert!(err.contains("unreadable"), "{err}");
+        let missing = file.with_extension("missing");
+        assert!(verify_signature(&missing, TEST_KEY, TEST_SIG, &comment).is_err());
+        let _ = std::fs::remove_file(file);
     }
 
     #[test]

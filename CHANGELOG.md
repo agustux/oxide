@@ -13,6 +13,15 @@ write for users: what changed and why it matters, not which files moved.
 
 ### Added
 
+- Updates now come from downloads.oxideterminal.com and are signed. Oxide
+  checks each downloaded update against a key built into the app before
+  offering to install it, and never installs one that doesn't match — even if
+  the download or the server were tampered with. GitHub is no longer in the
+  update path on macOS, so the check works even when GitHub is rate-limiting
+  or down. Linux reads the same source to learn about a release; the pill
+  still opens the release page, since packages come from the AUR or the
+  tarball.
+
 - Drag a file or directory in the file tree to move it: drop it on a
   directory to move it inside, on a file to move it beside that file, or on
   the empty space below the rows to move it to the tree's root. Nothing is

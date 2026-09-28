@@ -40,6 +40,9 @@ objc = "0.2"
 block = "0.1"
 # Also gpui's: the way from its window to the NSWindow, for background blur.
 raw-window-handle = "0.6"
+# Checks the updater's DMG against the minisign key in update.pub. No deps of
+# its own. Linux only announces releases, so it has nothing to verify.
+minisign-verify = "0.3"
 
 [profile.release]
 lto = "fat"

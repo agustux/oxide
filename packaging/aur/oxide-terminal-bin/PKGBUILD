@@ -1,7 +1,8 @@
 # Maintainer: Bobby Coleman <bobbycoleman.dev@gmail.com>
 #
-# Binary package from the GitHub release tarball. scripts/release-linux.sh
-# bumps pkgver and the checksum after each release; regenerate .SRCINFO with
+# Binary package from the release tarball on downloads.oxideterminal.com
+# (mirrored on the GitHub release). scripts/release-linux.sh bumps pkgver,
+# the URL and the checksum after each release; regenerate .SRCINFO with
 # `makepkg --printsrcinfo > .SRCINFO` before pushing to the AUR.
 pkgname=oxide-terminal-bin
 pkgver=0.6.3

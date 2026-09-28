@@ -46,7 +46,8 @@ brew install --cask oxide-terminal/tap/oxide-terminal
 Or grab the DMG from the [latest release](https://github.com/oxide-terminal/oxide/releases/latest)
 and drag Oxide to Applications. Builds are Developer ID signed and notarized, so there's no
 right-click-to-open dance, and Oxide keeps itself up to date afterwards — it checks on launch
-and every six hours, or on demand via **Oxide → Check for Updates…**
+and every six hours, or on demand via **Oxide → Check for Updates…** Updates are signed, and
+Oxide only installs one whose signature matches the key it was built with.
 
 **Linux** (Wayland or X11, x86_64)
 
