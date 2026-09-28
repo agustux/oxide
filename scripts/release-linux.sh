@@ -60,7 +60,8 @@ if [[ -z "${NO_UPLOAD:-}" ]]; then
     exit 1
   }
   # The Mac side writes the manifest; this script only adds to it.
-  curl -fsS "$DOWNLOADS/releases/$VERSION.json" -o "target/manifest-$VERSION.json" || {
+  # Query string: keep a miss off Cloudflare's cache (see remote_size below).
+  curl -fsS "$DOWNLOADS/releases/$VERSION.json?check=$RANDOM$RANDOM" -o "target/manifest-$VERSION.json" || {
     echo "error: $DOWNLOADS/releases/$VERSION.json isn't there — release.sh didn't finish?" >&2
     exit 1
   }
@@ -126,7 +127,7 @@ if [[ -z "${NO_UPLOAD:-}" ]]; then
   put "target/manifest-$VERSION-linux.json" "releases/$VERSION.json" application/json "$IMMUTABLE"
   # stable.json may already have moved on to a newer version (a hotfix on the
   # Mac before this ran); only replace it if it still describes this release.
-  STABLE_VERSION=$(curl -fsS "$DOWNLOADS/releases/stable.json" | jq -r .version)
+  STABLE_VERSION=$(curl -fsS "$DOWNLOADS/releases/stable.json?check=$RANDOM$RANDOM" | jq -r .version)
   if [[ "$STABLE_VERSION" == "$VERSION" ]]; then
     put "target/manifest-$VERSION-linux.json" "releases/stable.json" application/json "public, max-age=60"
   else
