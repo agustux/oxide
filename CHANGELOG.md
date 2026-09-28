@@ -11,6 +11,8 @@ write for users: what changed and why it matters, not which files moved.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-28
+
 ### Added
 
 - Updates now come from downloads.oxideterminal.com and are signed. Oxide
