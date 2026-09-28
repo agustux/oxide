@@ -64,7 +64,8 @@ pub fn open_modifier(m: &gpui::Modifiers) -> bool {
 }
 
 /// The system alert sound. Linux has no single "beep" API (XDG sound themes,
-/// ALSA, PipeWire…), so `bell = "sound"` degrades to the visual flash there.
+/// ALSA, PipeWire…), so it shells out to a sound tool; `bell = "sound"`
+/// degrades to the visual flash there if none is installed.
 fn system_beep() -> bool {
     #[cfg(target_os = "macos")]
     {
