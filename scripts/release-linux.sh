@@ -121,7 +121,8 @@ if [[ -z "${NO_UPLOAD:-}" ]]; then
   echo "==> adding linux-$ARCH to the update manifest"
   jq --arg k "linux-$ARCH" --arg url "$DOWNLOADS/$PREFIX/$NAME" --arg sha "$SHA" \
      --rawfile sig "$TARBALL.minisig" \
-     '.assets[$k] = {url: $url, sha256: $sha, signature: $sig}' \
+     --argjson size "$(stat -c %s "$TARBALL")" \
+     '.assets[$k] = {url: $url, size: $size, sha256: $sha, signature: $sig}' \
      "target/manifest-$VERSION.json" > "target/manifest-$VERSION-linux.json"
   jq -e --arg k "linux-$ARCH" '.assets[$k].url' "target/manifest-$VERSION-linux.json" >/dev/null
   put "target/manifest-$VERSION-linux.json" "releases/$VERSION.json" application/json "$IMMUTABLE"
@@ -132,6 +133,13 @@ if [[ -z "${NO_UPLOAD:-}" ]]; then
     put "target/manifest-$VERSION-linux.json" "releases/stable.json" application/json "public, max-age=60"
   else
     echo "note: stable.json is at $STABLE_VERSION, not $VERSION; left it alone"
+  fi
+
+  # What the website's Linux download link points at. Only when this is the
+  # current release, for the same reason as stable.json above.
+  if [[ "$STABLE_VERSION" == "$VERSION" ]]; then
+    echo "==> refreshing $DOWNLOADS/oxide/latest/oxide-linux-$ARCH.tar.gz"
+    put "$TARBALL" "oxide/latest/oxide-linux-$ARCH.tar.gz" application/gzip "public, max-age=300"
   fi
 fi
 

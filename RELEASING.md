@@ -57,7 +57,9 @@ This runs `dmg.sh` (sign, notarize, staple), then:
    section of `CHANGELOG.md` as the notes;
 4. writes the update manifest — `releases/stable.json` in the bucket, plus a
    `releases/<version>.json` copy for rollbacks;
-5. bumps the Homebrew cask and regenerates the site changelog.
+5. refreshes `oxide/latest/Oxide.dmg`, the one object that changes in place:
+   it's what the website's download links point at, so they never go stale;
+6. bumps the Homebrew cask and regenerates the site changelog.
 
 It refuses to run if the changelog section is missing or empty, so a
 forgotten changelog rename fails before the slow build starts, and likewise
@@ -131,11 +133,13 @@ as one JSON string; `jq -Rs . < file.minisig` produces it):
   "assets": {
     "macos-aarch64": {
       "url": "https://downloads.oxideterminal.com/oxide/0.7.0/Oxide-0.7.0-update.dmg",
+      "size": 11705200,
       "sha256": "<sha256 of the DMG>",
       "signature": "untrusted comment: …\n…\ntrusted comment: oxide 0.7.0 macos-aarch64\n…\n"
     },
     "linux-x86_64": {
       "url": "https://downloads.oxideterminal.com/oxide/0.7.0/oxide-0.7.0-linux-x86_64.tar.gz",
+      "size": 8000000,
       "sha256": "<sha256 of the tarball>",
       "signature": "…"
     }
@@ -144,7 +148,9 @@ as one JSON string; `jq -Rs . < file.minisig` produces it):
 ```
 
 (`linux-x86_64` is added by `release-linux.sh`; `release_url` is what the
-Linux pill opens.)
+Linux pill opens; `size` is for the website's download button. Finally
+`oxide/latest/Oxide.dmg` gets a copy of the DMG with
+`--cache-control "public, max-age=300"`.)
 
 The trusted comment must be exactly `oxide <version> macos-<arch>` — the
 updater checks it after the signature, so a real signature can't be reused for
@@ -169,8 +175,9 @@ This runs `linux-package.sh`, then signs `oxide-<version>-linux-x86_64.tar.gz`
 with the same minisign key, uploads it and its `.minisig` to the bucket
 under `oxide/<version>/`, mirrors it onto the GitHub release, adds a
 `linux-x86_64` entry to `releases/<version>.json` and `releases/stable.json`,
-and bumps `packaging/aur/oxide-terminal-bin/PKGBUILD` to the new version,
-URL and checksum. It refuses to run if the release or the manifest doesn't
+refreshes `oxide/latest/oxide-linux-x86_64.tar.gz` for the website's Linux
+download link, and bumps `packaging/aur/oxide-terminal-bin/PKGBUILD` to the
+new version, URL and checksum. It refuses to run if the release or the manifest doesn't
 exist yet, if the bucket already has this tarball, or if anything that goes
 into the build (`Cargo.*`, `src/`, `assets/`, `packaging/docker/`) changed
 since the tag — commits after the release that only touch docs are fine.
@@ -292,12 +299,30 @@ domain `downloads.oxideterminal.com`) already exists in the Cloudflare account.
    request, which caps objects at a few hundred MB — far above the DMG.
 
 3. **Caching.** Objects are uploaded with their `Cache-Control` set:
-   versioned files a year and immutable, `stable.json` one minute. Cloudflare's
+   versioned files a year and immutable, `stable.json` one minute, the
+   `oxide/latest/` copies five minutes. Cloudflare's
    edge honours these on the custom domain, so nothing further is needed. If
    an update ever seems slow to appear, purge `releases/stable.json` from the
    dashboard (Caching → Configuration → Custom Purge).
 
-4. **Try it** before a real release with `R2_BUCKET`/`DOWNLOADS_URL` pointed
+4. **Cross-origin reads.** The homepage's download button reads
+   `stable.json` from the browser to show the version, date and size, which
+   needs a CORS policy on the bucket (R2 → `oxide-releases` → Settings → CORS
+   policy). Without it the button still works; the version line just stays
+   blank.
+
+   ```json
+   [
+     {
+       "AllowedOrigins": ["https://oxideterminal.com"],
+       "AllowedMethods": ["GET", "HEAD"],
+       "AllowedHeaders": ["*"],
+       "MaxAgeSeconds": 3600
+     }
+   ]
+   ```
+
+5. **Try it** before a real release with `R2_BUCKET`/`DOWNLOADS_URL` pointed
    at a scratch bucket, or just check the pieces:
 
    ```sh

@@ -43,7 +43,7 @@ whether GitHub has a newer release.
 brew install --cask oxide-terminal/tap/oxide-terminal
 ```
 
-Or grab the DMG from the [latest release](https://github.com/oxide-terminal/oxide/releases/latest)
+Or [download the DMG](https://downloads.oxideterminal.com/oxide/latest/Oxide.dmg)
 and drag Oxide to Applications. Builds are Developer ID signed and notarized, so there's no
 right-click-to-open dance, and Oxide keeps itself up to date afterwards — it checks on launch
 and every six hours, or on demand via **Oxide → Check for Updates…** Updates are signed, and
@@ -58,11 +58,12 @@ git clone https://github.com/oxide-terminal/oxide.git
 cd oxide/packaging/aur/oxide-terminal-bin && makepkg -si
 
 # any distro: the release tarball
-tar xzf oxide-<version>-linux-x86_64.tar.gz
-cd oxide-<version>-linux-x86_64 && ./install.sh        # into ~/.local, no root
+tar xzf oxide-linux-x86_64.tar.gz
+cd oxide-*-linux-x86_64 && ./install.sh                # into ~/.local, no root
 ```
 
-The tarball is on the same [release page](https://github.com/oxide-terminal/oxide/releases/latest).
+[Download the tarball](https://downloads.oxideterminal.com/oxide/latest/oxide-linux-x86_64.tar.gz); older versions are on the
+[releases page](https://github.com/oxide-terminal/oxide/releases).
 `install.sh` puts `oxide` on your PATH and adds the launcher entry and icon;
 `--prefix /usr/local` (with sudo) installs system-wide, `--uninstall` removes it.
 Installed copies announce a newer release in the top-right corner; `git pull` and
