@@ -44,6 +44,11 @@ raw-window-handle = "0.6"
 # its own. Linux only announces releases, so it has nothing to verify.
 minisign-verify = "0.3"
 
+[dev-dependencies]
+# update.rs compiles its signature check under `cfg(test)` on every OS, so the
+# Linux test build needs the crate too (it stays out of Linux release builds).
+minisign-verify = "0.3"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
