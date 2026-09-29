@@ -17,9 +17,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/bobbycoleman-dev/oxide/releases/latest"><img src="https://img.shields.io/github/v/release/bobbycoleman-dev/oxide?color=e2725b" alt="Latest release" /></a>
-  <a href="https://github.com/bobbycoleman-dev/oxide/actions/workflows/ci.yml"><img src="https://github.com/bobbycoleman-dev/oxide/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/bobbycoleman-dev/oxide" alt="MIT license" /></a>
+  <a href="https://github.com/oxide-terminal/oxide/releases/latest"><img src="https://img.shields.io/github/v/release/oxide-terminal/oxide?color=e2725b" alt="Latest release" /></a>
+  <a href="https://github.com/oxide-terminal/oxide/actions/workflows/ci.yml"><img src="https://github.com/oxide-terminal/oxide/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/oxide-terminal/oxide" alt="MIT license" /></a>
   <a href="https://discord.gg/APV9FYGgeh"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Join the Discord" /></a>
 </p>
 
@@ -40,35 +40,38 @@ whether GitHub has a newer release.
 **macOS**
 
 ```sh
-brew install --cask bobbycoleman-dev/tap/oxide-terminal
+brew install --cask oxide-terminal/tap/oxide-terminal
 ```
 
-Or grab the DMG from the [latest release](https://github.com/bobbycoleman-dev/oxide/releases/latest)
+Or [download the DMG](https://downloads.oxideterminal.com/oxide/latest/Oxide.dmg)
 and drag Oxide to Applications. Builds are Developer ID signed and notarized, so there's no
 right-click-to-open dance, and Oxide keeps itself up to date afterwards — it checks on launch
-and every six hours, or on demand via **Oxide → Check for Updates…**
+and every six hours, or on demand via **Oxide → Check for Updates…** Updates are signed, and
+Oxide only installs one whose signature matches the key it was built with.
 
 **Linux** (Wayland or X11, x86_64)
 
 ```sh
 # Arch and derivatives: a pacman package from the PKGBUILD in this repo
 # (an AUR package will follow once AUR registration reopens)
-git clone https://github.com/bobbycoleman-dev/oxide.git
+git clone https://github.com/oxide-terminal/oxide.git
 cd oxide/packaging/aur/oxide-terminal-bin && makepkg -si
 
 # any distro: the release tarball
-tar xzf oxide-<version>-linux-x86_64.tar.gz
-cd oxide-<version>-linux-x86_64 && ./install.sh        # into ~/.local, no root
+tar xzf oxide-linux-x86_64.tar.gz
+cd oxide-*-linux-x86_64 && ./install.sh                # into ~/.local, no root
 ```
 
-The tarball is on the same [release page](https://github.com/bobbycoleman-dev/oxide/releases/latest).
+[Download the tarball](https://downloads.oxideterminal.com/oxide/latest/oxide-linux-x86_64.tar.gz); older versions are on the
+[releases page](https://github.com/oxide-terminal/oxide/releases).
 `install.sh` puts `oxide` on your PATH and adds the launcher entry and icon;
 `--prefix /usr/local` (with sudo) installs system-wide, `--uninstall` removes it.
 Installed copies announce a newer release in the top-right corner; `git pull` and
 `makepkg -si` again, or a fresh tarball, does the update.
 
-- macOS 12 or later, Apple Silicon or Intel; or Linux with a Vulkan driver
-  (any GPU from the last decade — Mesa's `vulkan-radeon` / `vulkan-intel`, or
+- macOS 12 or later, Apple Silicon or Intel; or Linux with glibc 2.35 or newer
+  (Ubuntu 22.04, Debian 12, Fedora 36 and later), a Vulkan driver (any GPU
+  from the last decade — Mesa's `vulkan-radeon` / `vulkan-intel`, or
   `nvidia-utils`) and `notify-send` (libnotify) for desktop notifications.
 - No font to install — JetBrainsMono Nerd Font Mono is bundled. Set `font.family` to use your own.
 - zsh or bash for the built-in prompt and shell integration. Other shells run fine and keep
@@ -100,14 +103,18 @@ The short tour. Every feature has a page in the [docs](https://oxideterminal.com
 - **File tree drawer** — follows the focused pane, so switching splits re-roots it to
   that shell's directory. Modeless vim navigation (`j`/`k`/`gg`/`G`, nvim-tree style `h`/`l`),
   type-to-filter with `/`, and file operations: `a` add, `r` rename, `m` move, `d` delete
-  (to Trash).
+  (to Trash) — or drag a row onto a directory to move it there. Drag the drawer's edge to
+  resize it.
   Dims gitignored files, watches the filesystem, and follows the shell's `cd` automatically.
 - **The tree/terminal seam** — `y` inserts the selected path at the prompt, quoted and
   relative; `cmd-click` a `path:line:col` in output to open it in `$EDITOR` at that line
   (nvim, VS Code, emacs, Sublime, Helix dialects built in); rows are coloured by git status;
   `cmd-p` fuzzy-finds any file under the root; `cmd-shift-r` reveals the shell's directory;
   right-click a row to re-root, copy, or reveal in Finder / your file manager — or, on a `.md` file, preview it
-  rendered in a new tab (tables, highlighted code with click-to-copy); drag rows or drop files onto a pane.
+  rendered in a new tab or split (`markdown.preview_in`; full CommonMark and GitHub markdown, with
+  tables and highlighted code with click-to-copy);
+  drag rows or drop files onto a pane. A file opened while the pane is busy in an editor gets a tab
+  or split of its own (`editor.open_in`).
 - **Scrollback search** — `cmd-f`, live, `⏎`/`⇧⏎` to walk matches; regex, case-sensitive,
   and whole-word toggles as clickable chips (`cmd-alt-r` / `c` / `w`), and a malformed
   regex says so instead of matching nothing.
@@ -149,6 +156,8 @@ The short tour. Every feature has a page in the [docs](https://oxideterminal.com
   border and a loud status-bar pill), `ctrl-w o` closes the others, `ctrl-w x` swaps with
   the neighbour. `window.inactive_pane_opacity` dims the panes you aren't in.
 - **Command palette** — `cmd-shift-p` lists every action with its binding, fuzzy-searchable.
+  Every text field edits like the rest of the system: `opt-←/→` by word, `opt-delete` a word
+  back, `cmd-←/→` to the ends (`ctrl` on Linux).
 - **Menus on Linux** — a ☰ button in the top-left corner holds the same Oxide / File /
   Edit / View / Window / Help menus macOS puts in the menu bar, shortcuts included
   (`app::menu` opens it from the keyboard).
@@ -165,8 +174,8 @@ The short tour. Every feature has a page in the [docs](https://oxideterminal.com
   (`tabs.show_numbers`), and the whole bar can be hidden — View → Toggle Tab Bar, or
   `tabs.enabled = false` — with the status bar still showing which tab you're on.
 - **Workspaces** — named sets of tabs and splits, tmux-session style, managed from the
-  drawer below the file tree (`a` add, `r` rename, `d` delete, `p` pin); `cmd-alt-1..9`
-  jump straight to one. Temporary by
+  drawer below the file tree (`a` add, `r` rename, `d` delete, `p` pin, drag to reorder);
+  `cmd-alt-1..9` jump straight to one. Temporary by
   default; pinned ones survive restarts, restoring layout, tabs, splits, and each
   pane's directory with fresh shells.
 - **Startup commands** — the tmuxinator move: give a pane a command (`ctrl-w r`,
@@ -239,6 +248,7 @@ The `ctrl-w` chords are the same everywhere. Where macOS uses `cmd`, Linux uses
 | `c` / `-` | re-root at selection / at parent (cd's the shell too) |
 | `/` | filter (`esc` clears) |
 | `a` / `r` / `m` / `d` | add (`dir/` with trailing slash) / rename / move / delete to Trash |
+| drag a row | onto a directory: move it there; onto a pane: insert its path |
 | `I` / `R` | toggle hidden / refresh |
 | `esc` | dismiss input → clear filter → back to terminal |
 
@@ -268,6 +278,7 @@ The `ctrl-w` chords are the same everywhere. Where macOS uses `cmd`, Linux uses
 | `j` / `k` | move selection |
 | `enter` / `o` | switch to workspace |
 | `a` / `r` / `d` | add / rename / delete (`y` confirms) — also on right-click |
+| drag a row | reorder |
 | `p` | pin — persist this workspace across restarts |
 | `e` | edit every pane's startup command — also on right-click |
 | `esc` | dismiss input → back to terminal |
@@ -305,6 +316,12 @@ accent = "#f38ba8"
 follow_cwd = true             # tree re-roots when the shell cd's
 open_on_startup = true        # false starts with the drawer hidden (cmd-b shows it)
 
+[editor]
+open_in = "tab"               # tab | split — where a file opens when the pane is busy
+
+[markdown]
+preview_in = "tab"            # tab | split — where a markdown preview opens
+
 [status_bar]
 enabled  = true
 position = "bottom"
@@ -340,7 +357,7 @@ sudo pacman -S --needed base-devel fontconfig freetype2 libxkbcommon libxkbcommo
 ```
 
 ```sh
-git clone https://github.com/bobbycoleman-dev/oxide.git
+git clone https://github.com/oxide-terminal/oxide.git
 cd oxide
 cargo run                     # development
 
@@ -401,11 +418,11 @@ with zero shell cooperation. Platform differences are confined to a handful of
 
 Questions, ideas, or just want to see what's coming? Join the
 [Oxide Terminal Discord](https://discord.gg/APV9FYGgeh). Bugs and feature requests go in
-[issues](https://github.com/bobbycoleman-dev/oxide/issues/new) — **Help → Report an Issue** in
+[issues](https://github.com/oxide-terminal/oxide/issues/new) — **Help → Report an Issue** in
 the menu bar (the ☰ menu on Linux), or *Report an Issue* in the command palette, goes to the same place. Wondering how Oxide stacks up against iTerm2, Ghostty,
 kitty, WezTerm, Alacritty, or Warp? There's an [honest comparison](https://oxideterminal.com/compare/).
 
-If Oxide earns a place in your dock, you can [buy me a coffee](https://www.buymeacoffee.com/bobbycoleman).
+If Oxide earns a place in your dock, you can [sponsor it on GitHub](https://github.com/sponsors/oxide-terminal) or [buy me a coffee](https://www.buymeacoffee.com/bobbycoleman).
 
 ## License
 

@@ -24,6 +24,24 @@ pub struct Config {
     pub cursor: CursorConfig,
     pub ssh: SshConfig,
     pub workspaces: WorkspacesConfig,
+    pub markdown: MarkdownConfig,
+}
+
+/// Where something that needs a pane of its own opens: a new tab, or a
+/// split to the right of the focused pane.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenIn {
+    #[default]
+    Tab,
+    Split,
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MarkdownConfig {
+    /// Where the rendered preview of a `.md` file opens.
+    pub preview_in: OpenIn,
 }
 
 /// Pinned-workspace restore: whether saved startup commands run, and how
@@ -165,6 +183,9 @@ pub struct EditorConfig {
     /// A shell command with `{path}`, `{line}`, and `{col}` substituted,
     /// e.g. `"myeditor --line {line} {path}"`. Overrides the mapping.
     pub open_at_line: Option<String>,
+    /// Where a file opens when the focused pane is busy — a terminal editor
+    /// still showing the last file, say — and can't take another.
+    pub open_in: OpenIn,
 }
 
 /// Desktop notifications when a long or failed command finishes in a pane
@@ -1003,5 +1024,18 @@ mod tabs_config_tests {
         assert!(!c.tabs.enabled && !c.tabs.show_numbers);
         assert_eq!(c.status_bar.tab, StatusBarTab::Name);
         assert!(toml::from_str::<Config>("[status_bar]\ntab = \"title\"\n").is_err());
+    }
+
+    #[test]
+    fn open_in_defaults_to_a_tab() {
+        let d = Config::default();
+        assert_eq!(d.editor.open_in, OpenIn::Tab);
+        assert_eq!(d.markdown.preview_in, OpenIn::Tab);
+        let c: Config =
+            toml::from_str("[editor]\nopen_in = \"split\"\n[markdown]\npreview_in = \"split\"\n")
+                .unwrap();
+        assert_eq!(c.editor.open_in, OpenIn::Split);
+        assert_eq!(c.markdown.preview_in, OpenIn::Split);
+        assert!(toml::from_str::<Config>("[editor]\nopen_in = \"window\"\n").is_err());
     }
 }

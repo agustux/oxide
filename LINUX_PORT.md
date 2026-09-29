@@ -23,7 +23,7 @@ Nothing else in the crate knows which OS it's on.
 | foreground cwd | `proc_pidinfo(PROC_PIDVNODEPATHINFO)` | `/proc/<pgrp>/cwd` | `terminal/session.rs` |
 | foreground name / argv | `proc_pidinfo` + `KERN_PROCARGS2` | `/proc/<pid>/comm` (+ `exe` for the untruncated name), `/proc/<pid>/cmdline` | `terminal/process.rs` |
 | notifications | `UNUserNotificationCenter` (bundle) / `osascript` | `notify-send -A default=Open -w`; a click prints the action and routes back to the pane | `notifications.rs`, `Cargo.toml` (`objc`/`block` are macOS-only deps) |
-| updater | download DMG, swap bundle, relaunch | announce only: pill opens the release page once a `-linux-<arch>.tar.gz` asset exists | `update.rs`, `app.rs` `UpdateState::Available` |
+| updater | download DMG, swap bundle, relaunch | announce only: pill opens the release page once the update manifest has a `linux-<arch>` entry | `update.rs`, `app.rs` `UpdateState::Available` |
 | "installed?" gate | running from a `.app` | release build outside a `target/` dir | `update::is_installed` |
 | trash | `~/.Trash` | XDG trash, via the `trash` crate on both | `tree/mod.rs` `delete_entry` |
 | reveal | `open -R` | `App::reveal_path` (Finder / `org.freedesktop.FileManager1`) on both | `tree/mod.rs`, `keymap/actions.rs` title |
@@ -119,7 +119,7 @@ to another window):
 2. **Last-window-close on Linux**: quit.
 3. **Trash**: the `trash` crate, both platforms.
 4. **Updater on Linux**: announce-only pill → release page; requires the
-   Linux tarball asset so the pill never points at a mac-only release.
+   manifest's Linux entry so the pill never points at a mac-only release.
 5. **`window.titlebar`**: ignored on Linux; GPUI requests server-side
    decorations (Hyprland: none; KDE/sway: a title bar; GNOME: none, no SSD).
 6. **Shift-at-launch**: key-event fallback, 1.5s window. `--no-startup-

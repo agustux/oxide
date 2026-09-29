@@ -12,7 +12,7 @@ use gpui::{
     ParentElement, Render, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 
-use crate::config::schema::{ColorsConfig, StatusBarPosition, StatusBarTab, TitlebarMode};
+use crate::config::schema::{ColorsConfig, OpenIn, StatusBarPosition, StatusBarTab, TitlebarMode};
 use crate::config::theme::parse_hex;
 use crate::config::{self, Config, Theme};
 use crate::git::{GitStatus, read_git_status};
@@ -20,14 +20,15 @@ use crate::keymap::actions::*;
 use crate::keymap::registry::{self, ActionContext, ActionMeta};
 use crate::keymap::resolve::pretty_keys;
 use crate::keymap::{self, ResolvedKeymap};
+use crate::line_edit::LineEdit;
 use crate::notifications;
 use crate::palette::{self, PaletteItem};
 use crate::panes::{Axis, Direction, Node, NodePath};
 use crate::startup::{OnExit, StartupCommand};
-use crate::terminal::colors::blend;
+use crate::terminal::colors::{blend, translucent};
 use crate::terminal::commands::format_duration;
 use crate::terminal::{LastLayout, TerminalEvent, TerminalPane};
-use crate::tree::{FileTree, TreeEvent};
+use crate::tree::{FileTree, TreeEvent, TreePrompt};
 use crate::workspaces::{SavedPane, SavedTab, SavedWorkspace};
 
 pub type PaneId = u64;
@@ -69,6 +70,67 @@ impl TabState {
 #[derive(Clone)]
 struct TabDrag {
     ix: usize,
+}
+
+/// A workspace being dragged up or down the panel, by its index.
+#[derive(Clone)]
+struct WsDrag {
+    ix: usize,
+}
+
+/// A workspace row's gap from the drawer's edges (`mx_2`), and its height.
+const WS_ROW_INSET: f32 = 8.0;
+const WS_ROW_HEIGHT: f32 = 26.0;
+
+/// What follows the pointer while a workspace is dragged: the row itself,
+/// lifted, kept in the panel's column so it only travels up and down.
+struct WsDragCard {
+    name: gpui::SharedString,
+    pinned: bool,
+    width: f32,
+    /// Where along the row it was grabbed.
+    grab_x: f32,
+    /// The preview is drawn outside the window's root, so it inherits
+    /// neither the font nor the colours.
+    font: gpui::SharedString,
+    theme: Rc<Theme>,
+}
+
+impl Render for WsDragCard {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = &self.theme;
+        let accent = theme.ansi[4];
+        let mut border = accent;
+        border.a = 0.5;
+        // GPUI draws the preview at the pointer, less where the row was
+        // grabbed; shift it back to the row's own left edge.
+        let drawn_at = f32::from(window.mouse_position().x) - self.grab_x;
+        div().w(px(self.width)).h(px(WS_ROW_HEIGHT)).child(
+            div()
+                .absolute()
+                .top_0()
+                .left(px(WS_ROW_INSET - drawn_at))
+                .w(px(self.width))
+                .h(px(WS_ROW_HEIGHT))
+                .px_2()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(blend(theme.background, accent, 0.2))
+                .shadow_lg()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .font_family(self.font.clone())
+                .text_size(px(13.0))
+                .text_color(theme.foreground)
+                .child(div().flex_1().truncate().child(self.name.clone()))
+                .when(self.pinned, |d| {
+                    d.child(div().flex_none().text_color(accent).child("\u{f08d}"))
+                }),
+        )
+    }
 }
 
 /// The label that follows the pointer while a tab is dragged.
@@ -130,13 +192,6 @@ struct AppMenu {
     open: usize,
 }
 
-/// Input modes for the workspaces panel footer, mirroring the file tree's.
-enum WsInput {
-    Add { buffer: String },
-    Rename { buffer: String },
-    ConfirmDelete,
-}
-
 pub struct Oxide {
     config: Rc<Config>,
     theme: Rc<Theme>,
@@ -146,7 +201,8 @@ pub struct Oxide {
     /// Cursor row in the workspaces panel (may differ from `active_ws`).
     ws_selected: usize,
     ws_focus: FocusHandle,
-    ws_input: Option<WsInput>,
+    /// The panel's footer is asking "delete? (y/n)" about the selected row.
+    ws_confirm_delete: bool,
     ws_context_menu: Option<WsContextMenu>,
     app_menu: Option<AppMenu>,
     /// The bundled icon for the About panel, decoded once per window.
@@ -157,6 +213,13 @@ pub struct Oxide {
     next_pane_id: PaneId,
     pane_subscriptions: HashMap<PaneId, Subscription>,
     drawer_visible: bool,
+    /// The width the drawer was dragged to; `tree.width` until it has been.
+    drawer_width: Option<f32>,
+    /// The drawer's edge is being dragged.
+    drawer_drag: bool,
+    /// `window.opacity < 1` and `window.blur` as the window last had them
+    /// applied, so a config reload can change either.
+    translucency: Option<(bool, bool)>,
     toasts: Vec<Toast>,
     next_toast_id: usize,
     git_status: GitStatus,
@@ -213,7 +276,8 @@ enum Overlay {
     ThemePicker(ThemePicker),
     History(HistoryState),
     FileFinder(FinderState),
-    TabRename(TabRenameState),
+    /// One line of text for whoever asked: a file's new name, a workspace's.
+    Prompt(PromptState),
     Confirm(ConfirmState),
     /// One pane's startup command, from the terminal.
     StartupCommand(StartupCommandState),
@@ -229,7 +293,7 @@ struct AboutState {
 
 struct StartupCommandState {
     pane: PaneId,
-    buffer: String,
+    buffer: LineEdit,
     on_exit: OnExit,
     /// Where the pane lives, for the header.
     cwd: Option<PathBuf>,
@@ -241,7 +305,7 @@ struct StartupRow {
     pane: PaneId,
     /// `tab 1 · pane 2 — ~/dev/api`
     label: String,
-    command: String,
+    command: LineEdit,
     on_exit: OnExit,
 }
 
@@ -254,11 +318,22 @@ struct StartupEditorState {
     return_focus: FocusTarget,
 }
 
-struct TabRenameState {
-    buffer: String,
-    /// Index of the tab in the active workspace.
-    tab: usize,
+struct PromptState {
+    /// The action being asked about: "Rename main.rs".
+    title: String,
+    hint: &'static str,
+    buffer: LineEdit,
+    action: PromptAction,
     return_focus: FocusTarget,
+}
+
+/// What a prompt's text is for. Indices are into the active workspace's
+/// tabs, or the workspace list.
+enum PromptAction {
+    Tree(TreePrompt),
+    WsAdd,
+    WsRename(usize),
+    TabRename(usize),
 }
 
 /// A yes/no question before something destructive.
@@ -295,7 +370,7 @@ struct FinderMatch {
 }
 
 struct FinderState {
-    query: String,
+    query: LineEdit,
     matches: Vec<FinderMatch>,
     selected: usize,
     scroll: usize,
@@ -326,7 +401,7 @@ struct HistoryMatch {
 }
 
 struct HistoryState {
-    query: String,
+    query: LineEdit,
     items: Vec<HistoryItem>,
     /// Indices into `items`, best first.
     matches: Vec<HistoryMatch>,
@@ -359,7 +434,7 @@ struct ThemePicker {
 const PALETTE_ROWS: usize = 12;
 
 struct PaletteState {
-    query: String,
+    query: LineEdit,
     /// The filtered, ranked list; recomputed on every keystroke.
     matches: Vec<PaletteItem>,
     selected: usize,
@@ -453,6 +528,32 @@ pub fn load_window_bounds() -> Option<gpui::Bounds<gpui::Pixels>> {
         origin: gpui::point(px(x), px(y)),
         size: gpui::size(px(w), px(h)),
     })
+}
+
+/// The width the drawer was last dragged to: a fifth number after the
+/// window's bounds, there only once it has been dragged.
+fn load_drawer_width() -> Option<f32> {
+    let text = std::fs::read_to_string(window_state_path()?).ok()?;
+    text.split_whitespace().nth(4)?.parse().ok()
+}
+
+/// No narrower than its rows are useful, no wider than leaves the terminal
+/// room.
+fn clamp_drawer_width(width: f32, window: f32) -> f32 {
+    width.clamp(160.0, (window - 240.0).max(160.0))
+}
+
+/// Where the item at `ix` sits after the one at `from` is moved to `to`.
+fn index_after_move(ix: usize, from: usize, to: usize) -> usize {
+    if ix == from {
+        to
+    } else if from < ix && to >= ix {
+        ix - 1
+    } else if from > ix && to <= ix {
+        ix + 1
+    } else {
+        ix
+    }
 }
 
 /// Quote a path for the shell: single-quoted, embedded quotes escaped.
@@ -665,7 +766,7 @@ impl Oxide {
             active_ws: 0,
             ws_selected: 0,
             ws_focus: cx.focus_handle(),
-            ws_input: None,
+            ws_confirm_delete: false,
             ws_context_menu: None,
             app_menu: None,
             app_icon: std::sync::Arc::new(gpui::Image::from_bytes(
@@ -677,6 +778,9 @@ impl Oxide {
             next_pane_id: 0,
             pane_subscriptions: HashMap::new(),
             drawer_visible,
+            drawer_width: load_drawer_width(),
+            drawer_drag: false,
+            translucency: None,
             toasts: Vec::new(),
             next_toast_id: 0,
             git_status: GitStatus::default(),
@@ -1100,6 +1204,17 @@ impl Oxide {
             .or_else(home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
         let id = self.create_pane(cwd, window, cx);
+        self.insert_split(id, direction, window, cx);
+    }
+
+    /// Put a pane that already exists beside the focused one, and focus it.
+    fn insert_split(
+        &mut self,
+        id: PaneId,
+        direction: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let target = self.active_id();
         let tab = self.tab_mut();
         tab.layout.split(&target, direction, id);
@@ -1419,21 +1534,26 @@ impl Oxide {
                 } else {
                     gpui::transparent_black()
                 };
-                // Dim the panes you aren't in. An overlay, not a recolour:
-                // one element, and it takes no mouse events, so a click
-                // still lands on the pane and focuses it.
+                // Dim the panes you aren't in by fading what they draw. The
+                // background is a layer of its own underneath, so a dimmed
+                // pane in a translucent window is no more solid than the
+                // rest. (A shade laid over the pane would be.)
                 let dim = self.config.window.inactive_pane_opacity.clamp(0.05, 1.0);
                 let dimmed = many && tab.zoomed.is_none() && *id != tab.active && dim < 1.0;
-                let mut shade = self.theme.background;
-                shade.a = 1.0 - dim;
+                let background = translucent(self.theme.background, self.config.window.opacity);
                 div()
                     .size_full()
                     .relative()
                     .overflow_hidden()
+                    .bg(background)
                     .border_1()
                     .border_color(ring)
-                    .child(pane.clone())
-                    .when(dimmed, |d| d.child(div().absolute().inset_0().bg(shade)))
+                    .child(
+                        div()
+                            .size_full()
+                            .when(dimmed, |d| d.opacity(dim))
+                            .child(pane.clone()),
+                    )
                     .into_any_element()
             }
             Node::Split {
@@ -1572,23 +1692,39 @@ impl Oxide {
             timer.await;
             this.update(cx, |this, _| {
                 this.bounds_save_scheduled = false;
-                if let (Some(b), Some(path)) = (this.last_bounds, window_state_path()) {
-                    let _ = std::fs::create_dir_all(path.parent().unwrap());
-                    let _ = std::fs::write(
-                        path,
-                        format!(
-                            "{} {} {} {}",
-                            f32::from(b.origin.x),
-                            f32::from(b.origin.y),
-                            f32::from(b.size.width),
-                            f32::from(b.size.height)
-                        ),
-                    );
-                }
+                this.write_window_state();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// The width it was dragged to, as far as this window allows; else
+    /// `tree.width`.
+    fn drawer_width(&self, window: &Window) -> f32 {
+        match self.drawer_width {
+            Some(w) => clamp_drawer_width(w, f32::from(window.viewport_size().width)),
+            None => self.config.tree.width,
+        }
+    }
+
+    /// The window's bounds, then the drawer's width once it has been dragged.
+    fn write_window_state(&self) {
+        let (Some(b), Some(path)) = (self.last_bounds, window_state_path()) else {
+            return;
+        };
+        let mut state = format!(
+            "{} {} {} {}",
+            f32::from(b.origin.x),
+            f32::from(b.origin.y),
+            f32::from(b.size.width),
+            f32::from(b.size.height)
+        );
+        if let Some(width) = self.drawer_width {
+            state.push_str(&format!(" {width}"));
+        }
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let _ = std::fs::write(path, state);
     }
 
     fn reload_config(&mut self, cx: &mut Context<Self>) {
@@ -1600,6 +1736,12 @@ impl Oxide {
                 let shell_or_prompt_changed = new_config.shell != self.config.shell
                     || new_config.prompt != self.config.prompt;
                 let keymap_changed = new_config.keymap != self.config.keymap;
+                // A new `tree.width` is a request for that width, dragged
+                // or not.
+                if new_config.tree.width != self.config.tree.width {
+                    self.drawer_width = None;
+                    self.write_window_state();
+                }
                 self.config = Rc::new(new_config);
                 self.run_startup_commands =
                     self.config.workspaces.run_startup_commands && !self.startup_skipped_at_launch;
@@ -1740,20 +1882,32 @@ impl Oxide {
             return;
         };
         let cwd = self.new_tab_cwd(cx);
-        self.open_pager_tab(&path, code, cwd, "what's new".into(), window, cx);
+        self.open_pager(
+            &path,
+            code,
+            cwd,
+            "what's new".into(),
+            OpenIn::Tab,
+            window,
+            cx,
+        );
     }
 
     /// Render a markdown file the way the changelog is and page it in a new
-    /// tab. The tab's cwd is the file's directory so relative links in it
-    /// resolve on cmd-click.
+    /// tab or split (`markdown.preview_in`). The pane's cwd is the file's
+    /// directory so relative links in it resolve on cmd-click.
     fn open_markdown_preview(
         &mut self,
         source: &Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((path, code)) = crate::markdown::write_preview(source, self.tab_columns(cx))
-        else {
+        let place = self.config.markdown.preview_in;
+        let columns = match place {
+            OpenIn::Tab => self.tab_columns(cx),
+            OpenIn::Split => self.split_columns(cx),
+        };
+        let Some((path, code)) = crate::markdown::write_preview(source, columns) else {
             self.toast(
                 ToastKind::Error,
                 format!("couldn't render {} for preview", source.display()),
@@ -1766,7 +1920,8 @@ impl Oxide {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.new_tab_cwd(cx));
         let name = source.file_name().unwrap_or_default().to_string_lossy();
-        self.open_pager_tab(&path, code, cwd, format!("preview: {name}"), window, cx);
+        let title = format!("preview: {name}");
+        self.open_pager(&path, code, cwd, title, place, window, cx);
     }
 
     /// Columns a terminal filling the current tab has: what a new tab's pager
@@ -1788,29 +1943,58 @@ impl Oxide {
         })
     }
 
-    /// Page a rendered (ANSI) file with `less` in a new tab of the current
-    /// workspace. The tab closes when `less` quits. `code` is what the
+    /// Columns a pane split off the focused one will have: half of it, less
+    /// a column for the divider. 40 before the first layout.
+    fn split_columns(&self, cx: &Context<Self>) -> usize {
+        let pad = self.config.window.padding.x * 2.0;
+        self.active_pane().read(cx).last_layout.map_or(40, |l| {
+            let half = f32::from(l.bounds.size.width) / 2.0;
+            (((half - pad) / l.cell_width) as usize).saturating_sub(1)
+        })
+    }
+
+    /// Page a rendered (ANSI) file with `less`. `code` is what the
     /// rendering's "copy" links copy.
-    fn open_pager_tab(
+    #[allow(clippy::too_many_arguments)]
+    fn open_pager(
         &mut self,
         path: &Path,
         code: Vec<String>,
         cwd: PathBuf,
         title: String,
+        place: OpenIn,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let wrap = if less_wraps_words() {
+            " --wordwrap"
+        } else {
+            ""
+        };
+        // -c: draw from the top. Left to itself less draws upward from the
+        // bottom row, so a file shorter than the pane opens at the bottom.
+        // --tilde: leave the rows past the end blank, not marked with `~`.
+        let command = format!("less -Rc --tilde{wrap} {}", shell_quote(path));
+        let id = self.open_command_pane(command, cwd, Some(title), place, window, cx);
+        self.panes[&id].update(cx, |pane, _| pane.preview_code = code);
+    }
+
+    /// A pane of its own for `command`: a new tab in the current workspace,
+    /// or a split to the right of the focused pane. It closes when the
+    /// command exits. The title is a tab's; a split has nowhere to show one.
+    fn open_command_pane(
+        &mut self,
+        command: String,
+        cwd: PathBuf,
+        title: Option<String>,
+        place: OpenIn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PaneId {
         let opener = self.active_id();
         let id = self.create_pane(cwd, window, cx);
         let timeout = self.config.workspaces.startup_timeout.0;
         self.panes[&id].update(cx, |pane, cx| {
-            pane.preview_code = code;
-            let wrap = if less_wraps_words() {
-                " --wordwrap"
-            } else {
-                ""
-            };
-            let command = format!("less -R{wrap} {}", shell_quote(path));
             pane.set_startup(
                 Some(StartupCommand {
                     command,
@@ -1820,14 +2004,40 @@ impl Oxide {
             );
             pane.arm_startup(timeout, cx);
         });
-        let ws = self.ws_mut();
-        ws.tabs.push(TabState {
-            title: Some(title),
-            opener: Some(opener),
-            ..TabState::new(Node::Leaf(id), id)
-        });
-        ws.active_tab = ws.tabs.len() - 1;
-        self.focus_pane(id, window, cx);
+        match place {
+            OpenIn::Tab => {
+                let ws = self.ws_mut();
+                ws.tabs.push(TabState {
+                    title,
+                    opener: Some(opener),
+                    ..TabState::new(Node::Leaf(id), id)
+                });
+                ws.active_tab = ws.tabs.len() - 1;
+                self.focus_pane(id, window, cx);
+            }
+            OpenIn::Split => self.insert_split(id, Direction::Right, window, cx),
+        }
+        id
+    }
+
+    /// Run `command` at the focused pane's prompt. A pane busy with a
+    /// program of its own — the editor still showing the last file, a build
+    /// — has no prompt to take it, so the command gets a pane of its own
+    /// (`editor.open_in`).
+    fn run_at_prompt(&mut self, command: String, window: &mut Window, cx: &mut Context<Self>) {
+        let (busy, cwd) = {
+            let pane = self.active_pane().read(cx);
+            (pane.is_busy(), pane.cwd.clone())
+        };
+        if busy {
+            let cwd = cwd.or_else(home_dir).unwrap_or_else(|| PathBuf::from("/"));
+            let place = self.config.editor.open_in;
+            self.open_command_pane(command, cwd, None, place, window, cx);
+            return;
+        }
+        self.active_pane()
+            .update(cx, |t, _| t.run_command(&command));
+        self.focus_terminal(Some(window), cx);
     }
 
     /// Bottom-right stack, newest at the bottom, lifted above the status bar
@@ -1921,6 +2131,15 @@ impl Oxide {
                 self.focus_terminal(Some(window), cx);
             }
             TreeEvent::FocusTerminal => self.focus_terminal(Some(window), cx),
+            TreeEvent::Prompt {
+                prompt,
+                title,
+                hint,
+                initial,
+            } => {
+                let action = PromptAction::Tree(prompt.clone());
+                self.open_prompt(title.clone(), hint, initial.clone(), action, window, cx);
+            }
         }
     }
 
@@ -2210,7 +2429,7 @@ impl Oxide {
             Overlay::ThemePicker(t) => t.return_focus,
             Overlay::History(h) => h.return_focus,
             Overlay::FileFinder(f) => f.return_focus,
-            Overlay::TabRename(r) => r.return_focus,
+            Overlay::Prompt(p) => p.return_focus,
             Overlay::Confirm(c) => c.return_focus,
             Overlay::StartupCommand(s) => s.return_focus,
             Overlay::StartupEditor(e) => e.return_focus,
@@ -2228,7 +2447,7 @@ impl Oxide {
             Some(Overlay::FileFinder(_)) => self.finder_move(delta, cx),
             Some(Overlay::StartupEditor(_)) => self.startup_editor_move(delta, cx),
             Some(
-                Overlay::TabRename(_)
+                Overlay::Prompt(_)
                 | Overlay::Confirm(_)
                 | Overlay::StartupCommand(_)
                 | Overlay::About(_),
@@ -2243,7 +2462,7 @@ impl Oxide {
             Some(Overlay::Palette(_)) => self.palette_confirm(window, cx),
             Some(Overlay::History(_)) => self.history_confirm(false, window, cx),
             Some(Overlay::FileFinder(_)) => self.finder_confirm(FinderAction::Open, window, cx),
-            Some(Overlay::TabRename(_)) => self.tab_rename_confirm(window, cx),
+            Some(Overlay::Prompt(_)) => self.prompt_confirm(window, cx),
             Some(Overlay::Confirm(_)) => self.confirm_run(window, cx),
             Some(Overlay::StartupCommand(_)) => self.startup_command_confirm(window, cx),
             Some(Overlay::StartupEditor(_)) => self.startup_editor_confirm(window, cx),
@@ -2291,7 +2510,7 @@ impl Oxide {
                 Overlay::Palette(_)
                 | Overlay::History(_)
                 | Overlay::FileFinder(_)
-                | Overlay::TabRename(_)
+                | Overlay::Prompt(_)
                 | Overlay::Confirm(_)
                 | Overlay::StartupCommand(_)
                 | Overlay::StartupEditor(_)
@@ -2302,12 +2521,12 @@ impl Oxide {
     }
 
     /// Text input shared by the overlays that have one.
-    fn overlay_query_mut(&mut self) -> Option<&mut String> {
+    fn overlay_query_mut(&mut self) -> Option<&mut LineEdit> {
         match &mut self.overlay {
             Some(Overlay::Palette(p)) => Some(&mut p.query),
             Some(Overlay::History(h)) => Some(&mut h.query),
             Some(Overlay::FileFinder(f)) => Some(&mut f.query),
-            Some(Overlay::TabRename(r)) => Some(&mut r.buffer),
+            Some(Overlay::Prompt(p)) => Some(&mut p.buffer),
             Some(Overlay::StartupCommand(s)) => Some(&mut s.buffer),
             Some(Overlay::StartupEditor(e)) => e.rows.get_mut(e.selected).map(|r| &mut r.command),
             _ => None,
@@ -2333,6 +2552,7 @@ impl Oxide {
             Some(s) => (s.command, s.on_exit),
             None => (last.unwrap_or_default(), OnExit::default()),
         };
+        let buffer = LineEdit::new(buffer);
         let return_focus = self.current_focus_target(window, cx);
         self.overlay = Some(Overlay::StartupCommand(StartupCommandState {
             pane,
@@ -2349,7 +2569,7 @@ impl Oxide {
         let Some(Overlay::StartupCommand(s)) = &self.overlay else {
             return;
         };
-        let (pane, command, on_exit) = (s.pane, s.buffer.trim().to_string(), s.on_exit);
+        let (pane, command, on_exit) = (s.pane, s.buffer.text.trim().to_string(), s.on_exit);
         let startup = (!command.is_empty()).then_some(StartupCommand { command, on_exit });
         if let Some(entity) = self.panes.get(&pane) {
             entity.update(cx, |p, cx| p.set_startup(startup.clone(), cx));
@@ -2413,7 +2633,7 @@ impl Oxide {
                 rows.push(StartupRow {
                     pane: id,
                     label,
-                    command,
+                    command: LineEdit::new(command),
                     on_exit,
                 });
             }
@@ -2453,7 +2673,7 @@ impl Oxide {
             .rows
             .iter()
             .map(|r| {
-                let command = r.command.trim().to_string();
+                let command = r.command.text.trim().to_string();
                 (
                     r.pane,
                     (!command.is_empty()).then_some(StartupCommand {
@@ -2547,17 +2767,7 @@ impl Oxide {
             .items_center()
             .gap_2()
             .child(div().text_color(accent).child("▸"))
-            .child(if s.buffer.is_empty() {
-                div()
-                    .flex_1()
-                    .text_color(dim)
-                    .child("▏nothing — just a shell")
-            } else {
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(format!("{}▏", s.buffer))
-            })
+            .child(self.render_line_edit(&s.buffer, "nothing — just a shell"))
             .child(self.on_exit_chip(s.on_exit, true));
         let footer = div()
             .flex_none()
@@ -2625,26 +2835,26 @@ impl Oxide {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_color(if row.command.is_empty() { dim } else { accent })
+                                    .text_color(if row.command.text.is_empty() {
+                                        dim
+                                    } else {
+                                        accent
+                                    })
                                     .child("▸"),
                             )
-                            .child(match (row.command.is_empty(), is_selected) {
-                                (true, true) => div()
-                                    .flex_1()
-                                    .text_color(dim)
-                                    .child("▏nothing — just a shell"),
+                            .child(match (row.command.text.is_empty(), is_selected) {
+                                (_, true) => {
+                                    self.render_line_edit(&row.command, "nothing — just a shell")
+                                }
                                 (true, false) => {
                                     div().flex_1().text_color(dim).child("just a shell")
                                 }
-                                (false, true) => div()
+                                (false, false) => div()
                                     .flex_1()
                                     .overflow_hidden()
-                                    .child(format!("{}▏", row.command)),
-                                (false, false) => {
-                                    div().flex_1().overflow_hidden().child(row.command.clone())
-                                }
+                                    .child(row.command.text.clone()),
                             })
-                            .when(!row.command.is_empty() || is_selected, |d| {
+                            .when(!row.command.text.is_empty() || is_selected, |d| {
                                 d.child(self.on_exit_chip(row.on_exit, is_selected))
                             }),
                     ),
@@ -2670,31 +2880,89 @@ impl Oxide {
     // --- Tab rename and confirmations ---
 
     fn open_tab_rename(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if tab >= self.ws().tabs.len() {
+        let Some(t) = self.ws().tabs.get(tab) else {
             return;
-        }
-        let return_focus = self.current_focus_target(window, cx);
-        let buffer = self.ws().tabs[tab].title.clone().unwrap_or_default();
-        self.overlay = Some(Overlay::TabRename(TabRenameState {
+        };
+        let buffer = LineEdit::new(t.title.clone().unwrap_or_default());
+        self.open_prompt(
+            "Rename tab".into(),
+            "empty name restores the automatic title",
             buffer,
-            tab,
+            PromptAction::TabRename(tab),
+            window,
+            cx,
+        );
+    }
+
+    fn open_ws_rename(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.workspaces.get(ix) else {
+            return;
+        };
+        let (title, buffer) = (
+            format!("Rename {}", ws.name),
+            LineEdit::new(ws.name.clone()),
+        );
+        self.open_prompt(title, "", buffer, PromptAction::WsRename(ix), window, cx);
+    }
+
+    /// The prompt modal: one line of text, titled with what it's for.
+    fn open_prompt(
+        &mut self,
+        title: String,
+        hint: &'static str,
+        buffer: LineEdit,
+        action: PromptAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let return_focus = self.current_focus_target(window, cx);
+        self.overlay = Some(Overlay::Prompt(PromptState {
+            title,
+            hint,
+            buffer,
+            action,
             return_focus,
         }));
         window.focus(&self.picker_focus);
         cx.notify();
     }
 
-    /// Set the title; an empty name goes back to the automatic one.
-    fn tab_rename_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(Overlay::TabRename(r)) = &self.overlay else {
+    /// Hand the text to whatever asked for it. Only a tab's name may be
+    /// empty: that goes back to the automatic title.
+    fn prompt_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.overlay, Some(Overlay::Prompt(_))) {
+            return;
+        }
+        let Some(Overlay::Prompt(p)) = self.overlay.take() else {
             return;
         };
-        let (tab, name) = (r.tab, r.buffer.trim().to_string());
-        if let Some(t) = self.ws_mut().tabs.get_mut(tab) {
-            t.title = (!name.is_empty()).then_some(name);
+        self.restore_focus(p.return_focus, window, cx);
+        let text = p.buffer.text.trim().to_string();
+        match p.action {
+            PromptAction::TabRename(tab) => {
+                if let Some(t) = self.ws_mut().tabs.get_mut(tab) {
+                    t.title = (!text.is_empty()).then_some(text);
+                }
+                self.save_workspaces(cx);
+            }
+            _ if text.is_empty() => {}
+            PromptAction::Tree(prompt) => {
+                self.tree
+                    .update(cx, |tree, cx| tree.apply_prompt(prompt, text, cx));
+            }
+            PromptAction::WsAdd => {
+                self.new_workspace(window, cx);
+                self.ws_mut().name = text;
+                self.save_workspaces(cx);
+            }
+            PromptAction::WsRename(ix) => {
+                if let Some(ws) = self.workspaces.get_mut(ix) {
+                    ws.name = text;
+                    self.save_workspaces(cx);
+                }
+            }
         }
-        self.close_overlay(window, cx);
-        self.save_workspaces(cx);
+        cx.notify();
     }
 
     /// The only confirmable action today is close-other-panes; `confirm_run` calls it directly.
@@ -2799,11 +3067,46 @@ impl Oxide {
         self.close_other_panes(window, cx);
     }
 
-    fn render_tab_rename_body(&self, r: &TabRenameState) -> gpui::Div {
+    /// A one-line input: the text either side of a thin caret (a glyph
+    /// would take a whole monospace cell), or a dimmed placeholder.
+    fn render_line_edit(&self, edit: &LineEdit, placeholder: &'static str) -> gpui::Div {
         let theme = &self.theme;
-        let accent = theme.ansi[4];
+        let caret = div()
+            .flex_none()
+            .w(px(1.5))
+            .h(px(14.0))
+            .bg(theme.foreground);
+        let row = div()
+            .flex_1()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .flex()
+            .flex_row()
+            .items_center();
+        if edit.text.is_empty() {
+            let dim = blend(theme.foreground, theme.background, 0.45);
+            return row
+                .child(caret)
+                .child(div().text_color(dim).child(placeholder));
+        }
+        let (before, after) = edit.split();
+        row.child(before.to_string())
+            .child(caret)
+            .child(after.to_string())
+    }
+
+    fn render_prompt_body(&self, p: &PromptState) -> gpui::Div {
+        let theme = &self.theme;
         let dim = blend(theme.foreground, theme.background, 0.45);
         let border = blend(theme.foreground, theme.background, 0.85);
+        let title = div()
+            .flex_none()
+            .px_3()
+            .py_1p5()
+            .border_b_1()
+            .border_color(border)
+            .text_color(blend(theme.foreground, theme.background, 0.3))
+            .child(p.title.clone());
         let input = div()
             .flex_none()
             .px_3()
@@ -2814,23 +3117,25 @@ impl Oxide {
             .flex_row()
             .items_center()
             .gap_2()
-            .child(div().text_color(accent).child("rename tab"))
-            .child(if r.buffer.is_empty() {
-                div().flex_1().text_color(dim).child("▏automatic title…")
-            } else {
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(format!("{}▏", r.buffer))
-            });
+            .child(div().text_color(theme.ansi[4]).child("▸"))
+            .child(self.render_line_edit(&p.buffer, ""));
+        let mut keys = String::from("⏎ confirm · esc cancel");
+        if !p.hint.is_empty() {
+            keys = format!("{keys} · {}", p.hint);
+        }
         let footer = div()
             .flex_none()
             .px_3()
             .py_1()
             .text_size(px(11.0))
             .text_color(dim)
-            .child("⏎ save · empty name restores the automatic title · esc cancel");
-        div().flex().flex_col().child(input).child(footer)
+            .child(keys);
+        div()
+            .flex()
+            .flex_col()
+            .child(title)
+            .child(input)
+            .child(footer)
     }
 
     fn render_confirm_body(&self, c: &ConfirmState) -> gpui::Div {
@@ -3055,7 +3360,7 @@ impl Oxide {
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let return_focus = self.current_focus_target(window, cx);
         self.overlay = Some(Overlay::Palette(PaletteState {
-            query: String::new(),
+            query: LineEdit::default(),
             matches: Vec::new(),
             selected: 0,
             scroll: 0,
@@ -3090,7 +3395,7 @@ impl Oxide {
         let Some(Overlay::Palette(p)) = &self.overlay else {
             return;
         };
-        let query = p.query.clone();
+        let query = p.query.text.clone();
         let recent: Vec<&str> = self.palette_recent.iter().copied().collect();
         let keymap = self.keymap.clone();
         let items = palette::build_items(&query, self.palette_candidates(), &recent, |id| {
@@ -3157,7 +3462,6 @@ impl Oxide {
         cx: &mut Context<Self>,
     ) {
         let ks = &event.keystroke;
-        let plain = !ks.modifiers.platform && !ks.modifiers.control && !ks.modifiers.function;
         if let Some(Overlay::Confirm(_)) = &self.overlay {
             match ks.key.as_str() {
                 "y" => self.confirm_run(window, cx),
@@ -3177,18 +3481,8 @@ impl Oxide {
             cx.stop_propagation();
             return;
         }
-        let Some(query) = self.overlay_query_mut() else {
+        if !self.overlay_query_mut().is_some_and(|q| q.handle(ks)) {
             return;
-        };
-        match ks.key.as_str() {
-            "backspace" => {
-                query.pop();
-            }
-            _ if plain => match &ks.key_char {
-                Some(c) => query.push_str(c),
-                None => return,
-            },
-            _ => return,
         }
         match &self.overlay {
             Some(Overlay::Palette(_)) => self.palette_refresh(),
@@ -3220,7 +3514,7 @@ impl Oxide {
     fn open_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let return_focus = self.current_focus_target(window, cx);
         self.overlay = Some(Overlay::FileFinder(FinderState {
-            query: String::new(),
+            query: LineEdit::default(),
             matches: Vec::new(),
             selected: 0,
             scroll: 0,
@@ -3292,7 +3586,7 @@ impl Oxide {
         let Some(Overlay::FileFinder(f)) = &mut self.overlay else {
             return;
         };
-        let query = f.query.trim().to_string();
+        let query = f.query.text.trim().to_string();
         let mut matcher = palette::Matcher::new(&query);
         let mut matches: Vec<FinderMatch> = entries
             .iter()
@@ -3397,14 +3691,7 @@ impl Oxide {
             .items_center()
             .gap_2()
             .child(div().text_color(accent).child(format!("{root_name}/")))
-            .child(if f.query.is_empty() {
-                div().flex_1().text_color(dim).child("▏find a file…")
-            } else {
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(format!("{}▏", f.query))
-            });
+            .child(self.render_line_edit(&f.query, "find a file…"));
 
         let mut list = div().flex().flex_col().p_1().gap(px(1.0));
         if self.finder_indexing && self.finder_index.is_none() {
@@ -3548,9 +3835,7 @@ impl Oxide {
             return;
         }
         let command = editor_command(path, at, &shell, self.config.editor.open_at_line.as_deref());
-        self.active_pane()
-            .update(cx, |t, _| t.run_command(&command));
-        self.focus_terminal(Some(window), cx);
+        self.run_at_prompt(command, window, cx);
     }
 
     // --- Command history (cmd-r) ---
@@ -3596,7 +3881,7 @@ impl Oxide {
         let return_focus = self.current_focus_target(window, cx);
         let items = self.gather_history(cx);
         self.overlay = Some(Overlay::History(HistoryState {
-            query: String::new(),
+            query: LineEdit::default(),
             items,
             matches: Vec::new(),
             selected: 0,
@@ -3613,7 +3898,7 @@ impl Oxide {
         let Some(Overlay::History(h)) = &mut self.overlay else {
             return;
         };
-        let query = h.query.trim().to_string();
+        let query = h.query.text.trim().to_string();
         let mut matcher = palette::Matcher::new(&query);
         let mut matches: Vec<HistoryMatch> = h
             .items
@@ -3700,17 +3985,7 @@ impl Oxide {
             .items_center()
             .gap_2()
             .child(div().text_color(accent).child("history"))
-            .child(if h.query.is_empty() {
-                div()
-                    .flex_1()
-                    .text_color(dim)
-                    .child("▏search commands you've run…")
-            } else {
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(format!("{}▏", h.query))
-            });
+            .child(self.render_line_edit(&h.query, "search commands you've run…"));
 
         let mut list = div().flex().flex_col().p_1().gap(px(1.0));
         if h.matches.is_empty() {
@@ -3851,14 +4126,7 @@ impl Oxide {
             .items_center()
             .gap_2()
             .child(div().text_color(accent).child(">"))
-            .child(if p.query.is_empty() {
-                div().flex_1().text_color(dim).child("▏type a command…")
-            } else {
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(format!("{}▏", p.query))
-            });
+            .child(self.render_line_edit(&p.query, "type a command…"));
 
         let mut list = div().flex().flex_col().p_1().gap(px(1.0));
         if p.matches.is_empty() {
@@ -3959,8 +4227,18 @@ impl Oxide {
         };
         let theme = &self.theme;
         let panel_bg = blend(theme.background, gpui::black(), 0.2);
+        // Dim the window behind the modal — but only a solid one. Over a
+        // translucent window the scrim is a second layer on every
+        // background, and the window goes dark and solid as if opacity and
+        // blur had been switched off.
+        // ponytail: no dimming at all when translucent; to dim there, each
+        // region would have to thin its own background while a modal is up.
         let mut backdrop = gpui::black();
-        backdrop.a = 0.35;
+        backdrop.a = if self.config.window.opacity < 1.0 {
+            0.0
+        } else {
+            0.35
+        };
 
         let panel = div()
             .key_context("Overlay")
@@ -4026,11 +4304,11 @@ impl Oxide {
                 .track_focus(&self.picker_focus)
                 .on_key_down(cx.listener(Self::on_overlay_key_down))
                 .child(self.render_finder_body(f, cx)),
-            Overlay::TabRename(r) => panel
+            Overlay::Prompt(p) => panel
                 .w(px(420.0))
                 .track_focus(&self.picker_focus)
                 .on_key_down(cx.listener(Self::on_overlay_key_down))
-                .child(self.render_tab_rename_body(r)),
+                .child(self.render_prompt_body(p)),
             Overlay::Confirm(c) => panel
                 .w(px(420.0))
                 .track_focus(&self.picker_focus)
@@ -4170,6 +4448,10 @@ impl Oxide {
     }
 
     fn end_divider_drag(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.drawer_drag) {
+            self.write_window_state();
+            cx.notify();
+        }
         if self.divider_drag.take().is_some() {
             self.save_workspaces(cx);
             cx.notify();
@@ -4226,12 +4508,10 @@ impl Oxide {
     }
 
     fn render_drag_overlay(&self, cx: &Context<Self>) -> gpui::Div {
-        let Some(drag) = &self.divider_drag else {
-            return div();
-        };
-        let cursor = match drag.axis {
-            Axis::Horizontal => gpui::CursorStyle::ResizeLeftRight,
-            Axis::Vertical => gpui::CursorStyle::ResizeUpDown,
+        // A pane divider, or the drawer's edge.
+        let cursor = match &self.divider_drag {
+            Some(drag) if drag.axis == Axis::Vertical => gpui::CursorStyle::ResizeUpDown,
+            _ => gpui::CursorStyle::ResizeLeftRight,
         };
         // Sits over everything while dragging so the pointer can leave the
         // divider, and so the terminals underneath never see the drag as a
@@ -4241,8 +4521,17 @@ impl Oxide {
             .inset_0()
             .occlude()
             .cursor(cursor)
-            .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _w, cx| {
-                this.update_divider_drag(ev.position, cx);
+            .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
+                if this.drawer_drag {
+                    // The drawer starts at the window's left edge, so the
+                    // pointer's x is its width.
+                    let window_width = f32::from(window.viewport_size().width);
+                    this.drawer_width =
+                        Some(clamp_drawer_width(f32::from(ev.position.x), window_width));
+                    cx.notify();
+                } else {
+                    this.update_divider_drag(ev.position, cx);
+                }
             }))
             .on_mouse_up(
                 gpui::MouseButton::Left,
@@ -4325,16 +4614,22 @@ impl Oxide {
         }
         let tab = ws.tabs.remove(from);
         ws.tabs.insert(to, tab);
-        let active = ws.active_tab;
-        ws.active_tab = if active == from {
-            to
-        } else if from < active && to >= active {
-            active - 1
-        } else if from > active && to <= active {
-            active + 1
-        } else {
-            active
-        };
+        ws.active_tab = index_after_move(ws.active_tab, from, to);
+        self.save_workspaces(cx);
+        cx.notify();
+    }
+
+    /// Reorder: move the workspace at `from` to `to`. The active workspace
+    /// and the panel's cursor stay on the workspaces they were on.
+    fn move_workspace(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let n = self.workspaces.len();
+        if from == to || from >= n || to >= n {
+            return;
+        }
+        let ws = self.workspaces.remove(from);
+        self.workspaces.insert(to, ws);
+        self.active_ws = index_after_move(self.active_ws, from, to);
+        self.ws_selected = index_after_move(self.ws_selected, from, to);
         self.save_workspaces(cx);
         cx.notify();
     }
@@ -4486,16 +4781,23 @@ impl Oxide {
 
     fn render_tab_bar(&self, cx: &Context<Self>) -> gpui::Div {
         let theme = &self.theme;
-        let bar_bg = blend(theme.background, gpui::black(), 0.25);
+        let bar_bg = translucent(
+            blend(theme.background, gpui::black(), 0.25),
+            self.config.window.opacity,
+        );
+        let active_bg = translucent(theme.background, self.config.window.opacity);
         let dim = blend(theme.foreground, theme.background, 0.45);
         let border = blend(theme.foreground, theme.background, 0.85);
+        // No background on the bar itself: each piece along it paints its
+        // own, so the active tab is a lighter stretch of the same single
+        // layer rather than a second one on top, which would make it more
+        // solid than the rest of a translucent window.
         let mut bar = div()
             .flex_none()
             .h(px(30.0))
             .flex()
             .flex_row()
             .items_center()
-            .bg(bar_bg)
             .border_b_1()
             .border_color(border)
             .text_size(px(12.0));
@@ -4503,7 +4805,13 @@ impl Oxide {
         // Linux: with the drawer hidden this bar is the top-left corner the
         // ☰ menu button floats over; leave it room before the first tab.
         if self.app_menu_corner() == Some(AppMenuCorner::TabBar) {
-            bar = bar.child(div().flex_none().w(px(APP_MENU_BUTTON_CLEARANCE)));
+            bar = bar.child(
+                div()
+                    .flex_none()
+                    .h_full()
+                    .w(px(APP_MENU_BUTTON_CLEARANCE))
+                    .bg(bar_bg),
+            );
         }
 
         for (ix, tab) in self.ws().tabs.iter().enumerate() {
@@ -4549,10 +4857,8 @@ impl Oxide {
                     .border_r_1()
                     .border_color(border)
                     .cursor_pointer()
-                    .when(is_active, |d| {
-                        d.bg(theme.background).text_color(theme.foreground)
-                    })
-                    .when(!is_active, |d| d.text_color(dim))
+                    .when(is_active, |d| d.bg(active_bg).text_color(theme.foreground))
+                    .when(!is_active, |d| d.bg(bar_bg).text_color(dim))
                     // Double-click renames; a single click selects.
                     .on_mouse_down(
                         gpui::MouseButton::Left,
@@ -4625,6 +4931,7 @@ impl Oxide {
                 .h_full()
                 .flex()
                 .items_center()
+                .bg(bar_bg)
                 .text_color(dim)
                 .cursor_pointer()
                 .on_mouse_down(
@@ -4635,6 +4942,8 @@ impl Oxide {
                 )
                 .child("+"),
         )
+        // The rest of the bar.
+        .child(div().flex_1().h_full().bg(bar_bg))
     }
 
     // --- Workspaces ---
@@ -4755,88 +5064,29 @@ impl Oxide {
         cx.notify();
     }
 
+    /// The panel's only footer question: "delete? (y/n)". Anything but y
+    /// cancels.
     fn on_ws_key_down(
         &mut self,
         event: &gpui::KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(mut input) = self.ws_input.take() else {
+        if !std::mem::take(&mut self.ws_confirm_delete) {
             return;
-        };
-        let ks = &event.keystroke;
-        let key_char = ks.key_char.clone();
-        let plain = !ks.modifiers.platform && !ks.modifiers.control;
-        match &mut input {
-            WsInput::Add { buffer } => match ks.key.as_str() {
-                "escape" => {}
-                "enter" => {
-                    let name = buffer.trim().to_string();
-                    if !name.is_empty() {
-                        self.new_workspace(window, cx);
-                        self.ws_mut().name = name;
-                        self.save_workspaces(cx);
-                    }
-                }
-                "backspace" => {
-                    buffer.pop();
-                    self.ws_input = Some(input);
-                }
-                _ => {
-                    if plain && let Some(c) = key_char {
-                        buffer.push_str(&c);
-                    }
-                    self.ws_input = Some(input);
-                }
-            },
-            WsInput::Rename { buffer } => match ks.key.as_str() {
-                "escape" => {}
-                "enter" => {
-                    let name = buffer.trim().to_string();
-                    if !name.is_empty()
-                        && let Some(ws) = self.workspaces.get_mut(self.ws_selected)
-                    {
-                        ws.name = name;
-                        self.save_workspaces(cx);
-                    }
-                }
-                "backspace" => {
-                    buffer.pop();
-                    self.ws_input = Some(input);
-                }
-                _ => {
-                    if plain && let Some(c) = key_char {
-                        buffer.push_str(&c);
-                    }
-                    self.ws_input = Some(input);
-                }
-            },
-            WsInput::ConfirmDelete => {
-                // Anything but y cancels.
-                if ks.key.as_str() == "y" {
-                    let ix = self.ws_selected;
-                    self.remove_workspace_at(ix, window, cx);
-                }
-            }
+        }
+        if event.keystroke.key == "y" {
+            let ix = self.ws_selected;
+            self.remove_workspace_at(ix, window, cx);
         }
         cx.stop_propagation();
         cx.notify();
     }
 
     fn ws_footer_text(&self) -> Option<String> {
-        match &self.ws_input {
-            Some(WsInput::Add { buffer }) => Some(format!("new: {buffer}▏")),
-            Some(WsInput::Rename { buffer }) => Some(format!("rename: {buffer}▏")),
-            Some(WsInput::ConfirmDelete) => {
-                let name = self
-                    .workspaces
-                    .get(self.ws_selected)
-                    .map(|w| w.name.clone())
-                    .unwrap_or_default();
-                Some(format!("delete {name}? (y/n)"))
-            }
-            None => None,
-        }
+        let name = &self.workspaces.get(self.ws_selected)?.name;
+        self.ws_confirm_delete
+            .then(|| format!("delete {name}? (y/n)"))
     }
 
     fn render_workspace_panel(&self, window: &Window, cx: &Context<Self>) -> gpui::Div {
@@ -4856,12 +5106,17 @@ impl Oxide {
             }
             let mut active_bg = accent;
             active_bg.a = 0.16;
+            let (drag_name, pinned): (gpui::SharedString, _) = (w.name.clone().into(), w.persist);
+            let font: gpui::SharedString = self.config.font.family.primary().to_string().into();
+            let drag_theme = self.theme.clone();
+            // The row spans the drawer, less its border and its own margins.
+            let row_width = self.drawer_width(window) - 1.0 - WS_ROW_INSET * 2.0;
             list = list.child(
                 div()
                     .id(("workspace", ix))
                     .flex_none()
-                    .h(px(26.0))
-                    .mx_2()
+                    .h(px(WS_ROW_HEIGHT))
+                    .mx(px(WS_ROW_INSET))
                     .my_0p5()
                     .px_2()
                     .rounded_md()
@@ -4890,6 +5145,20 @@ impl Oxide {
                             cx.notify();
                         }),
                     )
+                    // Drag a workspace onto another to reorder.
+                    .on_drag(WsDrag { ix }, move |_, grabbed, _window, cx| {
+                        cx.new(|_| WsDragCard {
+                            name: drag_name.clone(),
+                            pinned,
+                            width: row_width,
+                            grab_x: f32::from(grabbed.x),
+                            font: font.clone(),
+                            theme: drag_theme.clone(),
+                        })
+                    })
+                    .on_drop(cx.listener(move |this, drag: &WsDrag, _window, cx| {
+                        this.move_workspace(drag.ix, ix, cx);
+                    }))
                     .child(div().flex_1().truncate().child(w.name.clone()))
                     .when(self.workspace_has_startup(w, cx), |d| {
                         // Has startup commands, visible without opening anything.
@@ -4903,7 +5172,7 @@ impl Oxide {
         }
 
         div()
-            .key_context(if self.ws_input.is_some() {
+            .key_context(if self.ws_confirm_delete {
                 "WorkspacesInput"
             } else {
                 "Workspaces"
@@ -4929,24 +5198,23 @@ impl Oxide {
                 let ix = this.ws_selected;
                 this.select_workspace(ix, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &WsAdd, _w, cx| {
-                this.ws_input = Some(WsInput::Add {
-                    buffer: String::new(),
-                });
-                cx.notify();
+            .on_action(cx.listener(|this, _: &WsAdd, window, cx| {
+                this.open_prompt(
+                    "New workspace".into(),
+                    "",
+                    LineEdit::default(),
+                    PromptAction::WsAdd,
+                    window,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &WsDelete, _w, cx| {
-                this.ws_input = Some(WsInput::ConfirmDelete);
+                this.ws_confirm_delete = true;
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &WsRename, _w, cx| {
-                let buffer = this
-                    .workspaces
-                    .get(this.ws_selected)
-                    .map(|w| w.name.clone())
-                    .unwrap_or_default();
-                this.ws_input = Some(WsInput::Rename { buffer });
-                cx.notify();
+            .on_action(cx.listener(|this, _: &WsRename, window, cx| {
+                let ix = this.ws_selected;
+                this.open_ws_rename(ix, window, cx);
             }))
             .on_action(cx.listener(|this, _: &WsTogglePersist, _w, cx| {
                 if let Some(ws) = this.workspaces.get_mut(this.ws_selected) {
@@ -4960,8 +5228,8 @@ impl Oxide {
                 this.open_startup_editor(ix, window, cx);
             }))
             .on_action(cx.listener(|this, _: &WsEscape, window, cx| {
-                if this.ws_input.is_some() {
-                    this.ws_input = None;
+                if this.ws_confirm_delete {
+                    this.ws_confirm_delete = false;
                     cx.notify();
                 } else {
                     this.focus_terminal(Some(window), cx);
@@ -5084,15 +5352,8 @@ impl Oxide {
                         cx.listener(move |this, _: &gpui::MouseDownEvent, window, cx| {
                             this.ws_context_menu = None;
                             this.ws_selected = ix;
-                            let buffer = this
-                                .workspaces
-                                .get(ix)
-                                .map(|w| w.name.clone())
-                                .unwrap_or_default();
-                            this.ws_input = Some(WsInput::Rename { buffer });
-                            // Typing goes through the panel's key handler.
                             window.focus(&this.ws_focus);
-                            cx.notify();
+                            this.open_ws_rename(ix, window, cx);
                         }),
                     ))
                     .child(
@@ -5136,7 +5397,7 @@ impl Oxide {
                                     this.ws_context_menu = None;
                                     this.ws_selected = ix;
                                     // Same y/n confirmation the keyboard flow uses.
-                                    this.ws_input = Some(WsInput::ConfirmDelete);
+                                    this.ws_confirm_delete = true;
                                     window.focus(&this.ws_focus);
                                     cx.notify();
                                 }),
@@ -5390,7 +5651,10 @@ impl Oxide {
     fn render_status_bar(&self, cx: &Context<Self>) -> gpui::Div {
         let theme = &self.theme;
         let dim = blend(theme.foreground, theme.background, 0.35);
-        let bar_bg = blend(theme.background, gpui::black(), 0.25);
+        let bar_bg = translucent(
+            blend(theme.background, gpui::black(), 0.25),
+            self.config.window.opacity,
+        );
         // Linux: on top, this bar is the corner the ☰ menu button floats over.
         let under_menu_button = self.app_menu_corner() == Some(AppMenuCorner::StatusBar);
         let cwd_text = self
@@ -5680,6 +5944,60 @@ fn persist_preset(name: &str, variant: Option<&str>) -> Result<(), String> {
     std::fs::write(&path, doc.to_string()).map_err(|e| format!("couldn't write config: {e}"))
 }
 
+/// What GPUI is asked for. On macOS the blur isn't GPUI's to do: see
+/// `set_window_blur`.
+fn window_background(translucent: bool, blur: bool) -> gpui::WindowBackgroundAppearance {
+    match (translucent, blur) {
+        (false, _) => gpui::WindowBackgroundAppearance::Opaque,
+        (true, true) if !cfg!(target_os = "macos") => gpui::WindowBackgroundAppearance::Blurred,
+        (true, _) => gpui::WindowBackgroundAppearance::Transparent,
+    }
+}
+
+/// How far the blur behind a translucent window reaches, in points.
+#[cfg(target_os = "macos")]
+const WINDOW_BLUR_RADIUS: i64 = 30;
+
+/// Blur what's behind the window, or stop. This is the WindowServer call
+/// Terminal.app uses. GPUI's own blur — an `NSVisualEffectView` with its
+/// tint stripped out — leaves what's behind the window sharp on current
+/// macOS.
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)] // objc's macros test a cfg rustc doesn't know
+fn set_window_blur(window: &Window, on: bool) {
+    use objc::runtime::Object;
+    use objc::{msg_send, sel, sel_impl};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use std::ffi::c_void;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGSMainConnectionID() -> *mut c_void;
+        fn CGSSetWindowBackgroundBlurRadius(
+            connection: *mut c_void,
+            window: isize,
+            radius: i64,
+        ) -> i32;
+    }
+
+    // Spelled out: `Window::window_handle` is GPUI's own handle.
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    let radius = if on { WINDOW_BLUR_RADIUS } else { 0 };
+    unsafe {
+        let view = appkit.ns_view.as_ptr() as *mut Object;
+        let ns_window: *mut Object = msg_send![view, window];
+        if !ns_window.is_null() {
+            let number: isize = msg_send![ns_window, windowNumber];
+            CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), number, radius);
+        }
+    }
+}
+
 /// Open an Oxide window: shared by startup and the NewWindow action.
 /// `command` is the `-e` program for the first pane, only ever set for the
 /// window a launch opens; windows made from inside the app get a shell.
@@ -5691,15 +6009,7 @@ pub fn open_oxide_window(
     restore: bool,
     cx: &mut gpui::App,
 ) {
-    let window_background = if config.window.opacity < 1.0 {
-        if config.window.blur {
-            gpui::WindowBackgroundAppearance::Blurred
-        } else {
-            gpui::WindowBackgroundAppearance::Transparent
-        }
-    } else {
-        gpui::WindowBackgroundAppearance::Opaque
-    };
+    let window_background = window_background(config.window.opacity < 1.0, config.window.blur);
 
     // `window.titlebar` is a macOS setting: on Linux the compositor owns
     // decorations (GPUI asks for server-side ones; Hyprland and friends draw
@@ -5784,6 +6094,18 @@ impl Render for Oxide {
         let theme = self.theme.clone();
         let config = self.config.clone();
 
+        // Opacity repaints on its own; whether the window is see-through at
+        // all, and blurred, is the window's to be told — at first paint and
+        // after a config reload.
+        let translucency = (config.window.opacity < 1.0, config.window.blur);
+        if self.translucency != Some(translucency) {
+            self.translucency = Some(translucency);
+            let (see_through, blur) = translucency;
+            window.set_background_appearance(window_background(see_through, blur));
+            #[cfg(target_os = "macos")]
+            set_window_blur(window, see_through && blur);
+        }
+
         let title = self.active_pane().read(cx).title.clone();
         window.set_window_title(&title);
 
@@ -5810,13 +6132,21 @@ impl Render for Oxide {
 
         let tree_focused = self.tree_focus(cx).is_focused(window);
         let accent = theme.ansi[4];
+        let drawer_width = self.drawer_width(window);
+        // Like the pane dividers' grab areas: not under a modal or a menu.
+        let drawer_resizable = self.drawer_visible
+            && self.overlay.is_none()
+            && self.ws_context_menu.is_none()
+            && self.app_menu.is_none();
         // The 30px band is where macOS draws its traffic lights over our
         // content; Linux windows have no such inset.
         let hidden_titlebar =
             cfg!(target_os = "macos") && config.window.titlebar == TitlebarMode::Hidden;
 
-        let mut root_bg = theme.background;
-        root_bg.a = config.window.opacity.clamp(0.1, 1.0);
+        // One layer per region — the bars, the drawer's two halves, the
+        // panes — each at `window.opacity`, and none here underneath them
+        // when that's below 1: two layers at 0.5 are a window at 0.75.
+        let background = translucent(theme.background, config.window.opacity);
 
         div()
             .key_context("Root")
@@ -5824,7 +6154,7 @@ impl Render for Oxide {
             .relative()
             .flex()
             .flex_col()
-            .bg(root_bg)
+            .when(config.window.opacity >= 1.0, |d| d.bg(background))
             .on_modifiers_changed(
                 cx.listener(|this, ev: &gpui::ModifiersChangedEvent, _w, cx| {
                     this.on_launch_modifiers(ev.modifiers, cx);
@@ -5846,6 +6176,7 @@ impl Render for Oxide {
                         .left_0()
                         .right_0()
                         .h(px(30.0))
+                        .bg(background)
                         .window_control_area(gpui::WindowControlArea::Drag)
                         .on_click(|event, window, _cx| {
                             if event.click_count() >= 2 {
@@ -6012,9 +6343,7 @@ impl Render for Oxide {
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 let command = edit_file_command(&config::config_path(), &this.shell_program());
-                this.active_pane()
-                    .update(cx, |t, _| t.run_command(&command));
-                this.focus_terminal(Some(window), cx);
+                this.run_at_prompt(command, window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectTheme, window, cx| {
                 this.open_theme_picker(window, cx);
@@ -6093,6 +6422,7 @@ impl Render for Oxide {
             .child(
                 div()
                     .flex_1()
+                    .relative()
                     .flex()
                     .flex_row()
                     .min_h_0()
@@ -6102,7 +6432,7 @@ impl Render for Oxide {
                             .h_full()
                             .overflow_hidden()
                             .w(if self.drawer_visible {
-                                px(config.tree.width)
+                                px(drawer_width)
                             } else {
                                 px(0.0)
                             })
@@ -6125,7 +6455,7 @@ impl Render for Oxide {
                                             .overflow_hidden()
                                             .child(self.tree.clone()),
                                     )
-                                    .child(self.render_workspace_panel(window, cx))
+                                    .child(self.render_workspace_panel(window, cx).bg(background))
                             }),
                     )
                     .child(
@@ -6150,7 +6480,28 @@ impl Render for Oxide {
                                     self.render_pane_node(&layout, &Vec::new(), accent, window, cx),
                                 )
                             }),
-                    ),
+                    )
+                    // The drawer's right edge drags like a pane divider.
+                    .when(drawer_resizable, |d| {
+                        d.child(
+                            div()
+                                .id("drawer-resize")
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left(px(drawer_width - 4.0))
+                                .w(px(7.0))
+                                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(|this, _: &gpui::MouseDownEvent, _w, cx| {
+                                        cx.stop_propagation();
+                                        this.drawer_drag = true;
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                    }),
             )
             .when(status_bar && !bar_on_top, |d| {
                 d.child(self.render_status_bar(cx))
@@ -6226,11 +6577,11 @@ impl Render for Oxide {
             .when(self.app_menu.is_some(), |d| {
                 d.child(self.render_app_menu(window, cx))
             })
-            .when(self.divider_drag.is_some(), |d| {
+            .when(self.divider_drag.is_some() || self.drawer_drag, |d| {
                 d.child(self.render_drag_overlay(cx))
             })
             .when(self.overlay.is_some(), |d| d.child(self.render_overlay(cx)))
-            // Another app is frontmost: the same shade as inactive panes,
+            // Another app is frontmost: a shade in the background's colour,
             // over the whole window. Takes no mouse events, so the first
             // click still lands where it was aimed.
             .when(
@@ -6241,6 +6592,38 @@ impl Render for Oxide {
                     d.child(div().absolute().inset_0().bg(shade))
                 },
             )
+    }
+}
+
+#[cfg(test)]
+mod reorder_tests {
+    use super::*;
+
+    /// Dragging a tab or workspace must leave the active one active.
+    #[test]
+    fn indices_follow_their_items_through_a_move() {
+        for (from, to) in [(0, 3), (3, 0), (1, 2), (2, 2)] {
+            let mut items = vec!['a', 'b', 'c', 'd'];
+            let moved = items.remove(from);
+            items.insert(to, moved);
+            for (ix, item) in ['a', 'b', 'c', 'd'].into_iter().enumerate() {
+                let now = items.iter().position(|i| *i == item).unwrap();
+                assert_eq!(
+                    index_after_move(ix, from, to),
+                    now,
+                    "{item}: {from} -> {to}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_dragged_drawer_leaves_room_for_the_terminal() {
+        assert_eq!(clamp_drawer_width(20.0, 1200.0), 160.0);
+        assert_eq!(clamp_drawer_width(400.0, 1200.0), 400.0);
+        assert_eq!(clamp_drawer_width(1190.0, 1200.0), 960.0);
+        // A window too small for both: the drawer keeps its minimum.
+        assert_eq!(clamp_drawer_width(400.0, 300.0), 160.0);
     }
 }
 

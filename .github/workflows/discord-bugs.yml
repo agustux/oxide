@@ -1,0 +1,28 @@
+name: Post bug issues to Discord
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  notify:
+    if: github.event.label.name == 'bug'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_BUG_WEBHOOK }}
+          TITLE: ${{ github.event.issue.title }}
+          URL: ${{ github.event.issue.html_url }}
+          NUMBER: ${{ github.event.issue.number }}
+          AUTHOR: ${{ github.event.issue.user.login }}
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          jq -n \
+            --arg title "🐛 #$NUMBER $TITLE" \
+            --arg url "$URL" \
+            --arg author "$AUTHOR" \
+            --arg desc "$(printf '%s' "$BODY" | awk '/^### What happened\?/{f=1;next} /^### /{f=0} f' | head -c 300)" \
+            '{embeds: [{title: $title, url: $url, description: $desc,
+                        color: 15158332, author: {name: $author}}]}' \
+          | curl -sSf -H "Content-Type: application/json" -d @- "$WEBHOOK"
